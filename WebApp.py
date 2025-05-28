@@ -1,5 +1,6 @@
 from flask import Flask, jsonify, request, make_response
 from vlm import *
+from s3Uploader import *
 
 app = Flask(__name__)
 
@@ -45,7 +46,25 @@ def vlm_feature():
 
   return response
 
+@app.route('/api/v1/s3_upload', methods=['POST'])
+def s3_upload():
+  body = request.get_json()
+
+  video_uuid = body['video_uuid']
+  camera_id = body['camera_id']
+  detect_time = body['detect_time']
+
+  response = make_response()
+  if s3uploder.upload_file(video_uuid, camera_id, detect_time):
+    response.status_code = 200
+  else:
+    response.status_code = 400
+
+  return response
+
+
 if __name__ == '__main__':
     vlm = VLM()
+    s3uploder = s3Uploader()
     app.run(host="0.0.0.0", port=5000)
     
