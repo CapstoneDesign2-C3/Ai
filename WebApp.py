@@ -1,4 +1,5 @@
 from flask import Flask, jsonify, request, make_response
+from KeyframeExtractor import *
 from vlm import *
 from s3Uploader import *
 
@@ -20,7 +21,7 @@ def video_transfer():
 
 
 @app.route('/api/v1/yolo', methods=['POST'])
-def yolo():
+def yolo_detect():
   body = request.get_json()
 
   response = make_response()
@@ -64,7 +65,8 @@ def s3_upload():
 
 
 if __name__ == '__main__':
+    keyframeExtractor = KeyFrameExtractor()
     vlm = VLM()
-    s3uploder = s3Uploader()
+    s3uploder = S3Uploader()
     app.run(host="0.0.0.0", port=5000)
     
