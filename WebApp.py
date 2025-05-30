@@ -11,7 +11,7 @@ def video_transfer():
     return 'File is missing', 404
   
   video_data = request.files['file']
-
+  keyframeExtractor.process(video_data, camera_id=1)
 
   result = "temp"
   response = make_response(jsonify(result))
