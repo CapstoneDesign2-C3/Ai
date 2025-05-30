@@ -2,7 +2,7 @@ from dotenv import load_dotenv
 import boto3
 import os
 
-class s3Uploader:
+class S3Uploader:
     def __init__(self):
         load_dotenv(dotenv_path="env/aws.env")
         self.aws_access_key = os.getenv("AWS_ACCESS_KEY_ID")
