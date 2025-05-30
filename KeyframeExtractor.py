@@ -1,5 +1,6 @@
 import av
 import cv2
+from io import BytesIO
 import numpy as np
 from fractions import Fraction
 import uuid
@@ -21,8 +22,8 @@ class KeyFrameExtractor:
         self.mse_window_dict = {}
         self.flow_window_dict = {}
 
-    def open_video(self, input_path):
-        container = av.open(input_path)
+    def open_video(self, video_bytes):
+        container = av.open(BytesIO(video_bytes))
         video_stream = container.streams.video[0]
         fps = float(video_stream.average_rate)
         fps_int = int(fps)
@@ -103,11 +104,10 @@ class KeyFrameExtractor:
 
 
     #첫 프레임은 이전 프레임이 없음 => 그냥 prev를 첫 프레임으로
-    def get_first_gray_frame(self, path):
-        with av.open(path) as container:
+    def get_first_gray_frame(self, video_bytes):
+        with av.open(BytesIO(video_bytes)) as container:
             for frame in container.decode(video=0):
                 return self.convert_gray_and_resize(frame)
-        raise ValueError(f"비디오에서 프레임을 찾을 수 없습니다: {path}")
 
     def convert_gray_and_resize(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -188,15 +188,16 @@ class KeyFrameExtractor:
         out_stream.time_base = Fraction(1, self.output_fps)
         return output,out_stream
     
-    def process(self, input_path, camera_id):
+    def process(self, video_data, camera_id):
         video_uuid = str(uuid.uuid4())
         output_path = f"temp/{video_uuid}.mp4"
-        container, video_stream, fps_int = self.open_video(input_path)
+        video_bytes = video_data.read()
+        container, video_stream, fps_int = self.open_video(video_bytes)
         output, out_stream = self.init_new_segment_output(video_stream, output_path)
 
 
         flow_window, mse_window, is_new = self.get_or_create_windows(camera_id)
-        first_gray_frame = self.get_first_gray_frame(input_path)
+        first_gray_frame = self.get_first_gray_frame(video_bytes)
         if is_new:
             prev_gray_resized, mean_frame = self.fill_windows(first_gray_frame, container, fps_int, flow_window, mse_window)
             
