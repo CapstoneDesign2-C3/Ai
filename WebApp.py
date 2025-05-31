@@ -13,7 +13,7 @@ def video_transfer():
   video_data = request.files['file']
   keyframeExtractor.process(video_data, camera_id=1)
 
-  result = "temp"
+  result = "done"
   response = make_response(jsonify(result))
   response.status_code = 200
 
