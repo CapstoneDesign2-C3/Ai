@@ -24,8 +24,11 @@ class VLM:
     self.translation_model = MBartForConditionalGeneration.from_pretrained(self.translation_model_name)
     self.translation_tokenizer = MBart50TokenizerFast.from_pretrained(self.translation_model_name)
 
-  def vlm_summary(self, video_data):
-    question = "Please summarize the contents of the video concisely, except for lyrical expressions. If car accidents and casualties are included, please summarize including the situation."
+  def vlm_summary(self, angle, video_data):
+    question = "영상은 현재 " + angle + "을 비추고 있는 카메라 영상입니다."
+    "서정적인 표현을 제외하고 영상 내용을 간결하게 요약해 주세요. " \
+    "자동차 사고 및 사상자가 포함된 경우 상황을 포함하여 요약해 주세요. " \
+    "답변은 영어로 해주세요."
     output = self.model.chat(video_path=video_data, 
                                             tokenizer=self.tokenizer, 
                                             user_prompt=question, 
@@ -35,7 +38,7 @@ class VLM:
     return self.translate(output)
 
   def vlm_feature(self, image_data):
-    question = "Give us your impression of an object in a given video."
+    question = "주어진 동영상에서 사물에 대한 인상을 알려주세요. 답변은 영어로 해주세요."
     output = self.model.chat(video_path=self.convert(image_data), 
                                             tokenizer=self.tokenizer, 
                                             user_prompt=question, 

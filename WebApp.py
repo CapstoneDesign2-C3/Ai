@@ -1,5 +1,4 @@
 from flask import Flask, jsonify, request, make_response
-from KeyframeExtractor import *
 from vlm import *
 from s3Uploader import *
 
@@ -11,9 +10,9 @@ def video_transfer():
     return 'File is missing', 404
   
   video_data = request.files['file']
-  keyframeExtractor.process(video_data, camera_id=1)
 
-  result = "done"
+
+  result = "temp"
   response = make_response(jsonify(result))
   response.status_code = 200
 
@@ -21,7 +20,7 @@ def video_transfer():
 
 
 @app.route('/api/v1/yolo', methods=['POST'])
-def yolo_detect():
+def yolo():
   body = request.get_json()
 
   response = make_response()
@@ -33,7 +32,9 @@ def yolo_detect():
 def vlm_summary():
   body = request.get_json()
   
-  response = make_response(jsonify(vlm.vlm_summary(video_data=body)))
+  video_url = body.get('videoUrl')
+  angle = body.get('angle')
+  response = make_response(jsonify(vlm.vlm_feature(angle=angle, video_data=video_url)))
   response.status_code = 200
 
   return response
@@ -41,8 +42,8 @@ def vlm_summary():
 @app.route('/api/v1/vlm_feature', methods=['POST'])
 def vlm_feature():
   body = request.get_json()
-
-  response = make_response(jsonify(vlm.vlm_feature(video_data=body)))
+  image_url = body.get('imageUrl')
+  response = make_response(jsonify(vlm.vlm_feature(image_data=image_url)))
   response.status_code = 200
 
   return response
@@ -65,7 +66,6 @@ def s3_upload():
 
 
 if __name__ == '__main__':
-    keyframeExtractor = KeyFrameExtractor()
     vlm = VLM()
     s3uploder = S3Uploader()
     app.run(host="0.0.0.0", port=5000)
