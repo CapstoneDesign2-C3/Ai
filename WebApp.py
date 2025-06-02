@@ -14,7 +14,7 @@ tracker = TrackerModule()
 
 # 영상 경로
 DATA_ROOT = './data'
-ORIGINAL_VIDEOS = os.path.join(DATA_ROOT, 'original_videos')
+ORIGINAL_VIDEOS = os.path.join(DATA_ROOT, 'transfered_videos')
 TRACKING_RESULTS = os.path.join(DATA_ROOT, 'tracking_results')
 VLM_SUMMARIES = os.path.join(DATA_ROOT, 'vlm_summaries')
 
@@ -23,18 +23,17 @@ os.makedirs(ORIGINAL_VIDEOS, exist_ok=True)
 os.makedirs(TRACKING_RESULTS, exist_ok=True)
 os.makedirs(VLM_SUMMARIES, exist_ok=True)
 
-
 @app.route('/api/v1/transfer', methods=['POST'])
 def video_transfer():
     if 'file' not in request.files:
         return 'File is missing', 404
     
     video_data = request.files['file']
-    video_uuid = str(uuid.uuid4())  # UUID 생성
+    video_uuid = str(uuid.uuid4())  # UUID 생성 여기에 날짜나 카메라 번호 등 입력하면 좋을 듯 함. format 정해야 할 듯.
     save_path = os.path.join(ORIGINAL_VIDEOS, f"{video_uuid}.mp4")
     video_data.save(save_path)
 
-    # 반환: video_uuid
+    # 반환: json화된 video_uuid
     response = make_response(jsonify({
         'video_uuid': video_uuid
     }))
@@ -42,11 +41,11 @@ def video_transfer():
 
     return response
 
-# Step 2: YOLO Tracker 실행
+# YOLO Tracker 실행
 @app.route('/api/v1/yolo', methods=['POST'])
 def yolo():
     body = request.get_json()
-    video_uuid = body.get('video_uuid')
+    video_uuid = body.get('video_uuid') # 일단 body에 담는 방식으로 작성함.
     if not video_uuid:
         return 'video_uuid is required', 400
     
@@ -55,7 +54,7 @@ def yolo():
         return 'Video path invalid', 400
 
     # Tracker 결과 output 디렉토리 생성
-    tracker_output_dir = os.path.join(TRACKING_RESULTS, video_uuid)
+    tracker_output_dir = os.path.join(TRACKING_RESULTS, video_uuid) # 이 부분 날짜/카메라 번호로 수정 필요함.
     os.makedirs(tracker_output_dir, exist_ok=True)
 
     # Tracker 실행
