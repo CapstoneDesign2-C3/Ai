@@ -1,0 +1,7 @@
+pip>=23.0
+transformers==4.40.1
+av
+imageio
+decord
+opencv-python
+flash-attn
