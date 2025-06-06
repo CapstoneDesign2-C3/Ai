@@ -1,3 +1,5 @@
 aws.env
 __pycache__
 temp/
+venv_ai_server
+Yolov7_StrongSORT_OSNet/
