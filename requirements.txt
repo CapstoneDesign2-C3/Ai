@@ -4,8 +4,11 @@ av
 imageio
 decord
 opencv-python
-flash-attn
+# 로컬에서 못돌려서 임시 주석 처리함.
+##flash-attn
 
+#flask
+flask==2.3.3
 
 # 여기서부터 track.py 위한 requirements.
 # Base ----------------------------------------

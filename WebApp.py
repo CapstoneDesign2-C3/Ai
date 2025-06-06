@@ -126,7 +126,6 @@ def s3_upload():
 
 
 if __name__ == '__main__':
-    vlm = VLM()
     s3uploder = S3Uploader()
     app.run(host="0.0.0.0", port=5000)
     
