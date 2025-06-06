@@ -2,6 +2,7 @@ from flask import Flask, jsonify, request, make_response
 from vlm import *
 from s3Uploader import *
 from tracker import *
+from backend import *
 import os
 import uuid
 import json
@@ -74,6 +75,7 @@ def yolo():
 def vlm_summary():
     body = request.get_json()
     video_uuid = body.get('video_uuid')
+    
     angle = body.get('angle')
 
     if not video_uuid:
@@ -84,18 +86,19 @@ def vlm_summary():
         return 'Video path invalid', 400
 
     print(f"Running VLM summary on: {video_path}, angle: {angle}")
-    summary_result = vlm.vlm_summary(angle, video_path)
+    summary = vlm.vlm_summary(angle, video_path)
 
-    # summary 저장
-    summary_save_path = os.path.join(VLM_SUMMARIES, f"{video_uuid}.json")
-    with open(summary_save_path, 'w', encoding='utf-8') as f:
-        json.dump({'summary': summary_result}, f, ensure_ascii=False, indent=2)
+    cameraId = body.get('cameraId')
+    startTime = body.get('startTime')
+    thumbnailUrl = 'temp' # thumbnailUrl 없어서 일단 temp로
+    status = body.get('status')
 
-    response = make_response(jsonify({
-        'summary': summary_result,
-        'video_uuid': video_uuid
-    }))
-    response.status_code = 200
+    response = post_summary(cameraId=cameraId, 
+                 summary=summary, 
+                 videoUrl=video_path, 
+                 startTime=startTime, 
+                 thumbnailUrl=thumbnailUrl, 
+                 status=status)
 
     return response
 
@@ -103,8 +106,21 @@ def vlm_summary():
 def vlm_feature():
   body = request.get_json()
   image_url = body.get('imageUrl')
-  response = make_response(jsonify(vlm.vlm_feature(image_data=image_url)))
-  response.status_code = 200
+  reId = body.get('reId')
+  startFrame = body.get('startFrame')
+  endFrame = body.get('endFrame')
+  videoUrl = body.get('videoUrl')
+  cameraId = body.get('cameraId')
+  status = body.get('status')
+  feature = vlm.vlm_feature(image_data=image_url)
+  
+  response = post_feature(reId=reId, 
+                        feature=feature, 
+                        startFrame=startFrame,
+                        endFrame=endFrame, 
+                        videoUrl=videoUrl, 
+                        cameraId=cameraId,
+                        status=status)
 
   return response
 
