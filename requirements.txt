@@ -5,11 +5,12 @@ imageio
 decord
 opencv-python
 flash-attn
-# pip install -r requirements.txt
 
-# base ----------------------------------------
+
+# 여기서부터 track.py 위한 requirements.
+# Base ----------------------------------------
 matplotlib>=3.2.2
-numpy>=1.18.5
+numpy>=1.18.5,<1.24.0
 opencv-python>=4.1.1
 Pillow>=7.1.2
 PyYAML>=5.3.1
@@ -20,33 +21,27 @@ torchvision>=0.8.1,!=0.13.0
 tqdm>=4.41.0
 protobuf<4.21.3
 
-# plotting ------------------------------------
+# Logging -------------------------------------
+tensorboard>=2.4.1
+# wandb
 
+# Plotting ------------------------------------
 pandas>=1.1.4
 seaborn>=0.11.0
 
-# deep_sort -----------------------------------
-
-easydict
-
-# torchreid -----------------------------------
-
-Cython
-h5py
-six
-tb-nightly
-future
-yacs
-gdown
-flake8
-yapf
-isort==4.3.21
-imageio
-torchreid
-
 # Export --------------------------------------
-#onnx>=1.9.0  # ONNX export
-#onnx-simplifier>=0.4.1  # ONNX simplifier
-#tensorflow>=2.4.1  # TFLite export (or tensorflow-cpu, tensorflow-aarch64)
-#openvino-dev  # OpenVINO export
-#git+https://github.com/PINTO0309/openvino2tensorflow #OpenVINO to TFLite export
+# coremltools>=4.1  # CoreML export
+# onnx>=1.9.0  # ONNX export
+# onnx-simplifier>=0.3.6  # ONNX simplifier
+# scikit-learn==0.19.2  # CoreML quantization
+# tensorflow>=2.4.1  # TFLite export
+# tensorflowjs>=3.9.0  # TF.js export
+# openvino-dev  # OpenVINO export
+
+# Extras --------------------------------------
+ipython  # interactive notebook
+psutil  # system utilization
+thop  # FLOPs computation
+# albumentations>=1.0.3
+# pycocotools>=2.0  # COCO mAP
+# roboflow
