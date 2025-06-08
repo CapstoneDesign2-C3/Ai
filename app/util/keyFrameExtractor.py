@@ -5,6 +5,7 @@ import numpy as np
 from fractions import Fraction
 import uuid
 from collections import deque
+from app.Config import ORIGINAL_VIDEOS
 
 class KeyFrameExtractor:
     def __init__(self):
@@ -188,9 +189,9 @@ class KeyFrameExtractor:
         out_stream.time_base = Fraction(1, self.output_fps)
         return output,out_stream
     
-    def process(self, video_data, camera_id):
+    def process(self, video_data, camera_id, frame_queue):
         video_uuid = str(uuid.uuid4())
-        output_path = f"temp/{video_uuid}.mp4"
+        output_path = f"{ORIGINAL_VIDEOS}/{video_uuid}.mp4"
         video_bytes = video_data.read()
         container, video_stream, fps_int = self.open_video(video_bytes)
         output, out_stream = self.init_new_segment_output(video_stream, output_path)
@@ -215,9 +216,10 @@ class KeyFrameExtractor:
 
             if frame_index % (self.input_segment_sec * fps_int) == 0:
                 self.end_segment(output, out_stream, selected_count)
+                frame_queue.put(output_path)
 
                 video_uuid = str(uuid.uuid4())
-                output_path = f"temp/{video_uuid}.mp4"
+                output_path = f"{ORIGINAL_VIDEOS}/{video_uuid}.mp4"
                 output, out_stream = self.init_new_segment_output(video_stream, output_path)
 
                 flow_threshold, mse_threshold, min_mse_threshold, max_mse_threshold, recovery_factor, relax_factor = self.set_segment_factors(mse_window, flow_window)
@@ -244,6 +246,10 @@ class KeyFrameExtractor:
         packet = out_stream.encode(None)
         if packet:
             output.mux(packet)
+        
         container.close()
         output.close()
+
+        frame_queue.put(output_path)
+        frame_queue.put(None)
         return
