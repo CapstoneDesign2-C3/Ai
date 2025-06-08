@@ -14,6 +14,7 @@ class S3Uploader:
         self.s3_bucket = bucket_name
     
     def upload_file(self, video_uuid, camera_id, detect_time):
+        print("S3Uploader upload_file start")
         try:
             local_file_path = f"{ORIGINAL_VIDEOS}/{video_uuid}.mp4"
             s3_key = f"{str(camera_id)}/{str(detect_time)}/{str(video_uuid)}"

@@ -34,19 +34,23 @@ def run_pipeline(video_data, camera_id, app):
 
 
 def yolo_worker(tracker, frame_queue, yolo_queue):
+    print("yolo_worker start")
     while True:
         video_url = frame_queue.get()
         if video_url is None:
             yolo_queue.put(None)
             break
+        print("yolo_worker : tracker.run")
         result = tracker.run(video_url)
         yolo_queue.put(result)
 
 def vlm_worker(vlm, backend_client, yolo_queue, camera_id, start_time, thumbnail_url, status):
+    print("vlm_worker start")
     while True:
         video_url = yolo_queue.get()
         if video_url is None:
             break
+        print("vlm_worker : vlm.vlm_summary()")
         summary = vlm.vlm_summary(video_url)
 
         asyncio.run(backend_client.post_summary(
