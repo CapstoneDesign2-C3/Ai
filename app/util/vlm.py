@@ -28,6 +28,7 @@ class VLM:
     self.translation_tokenizer = MBart50TokenizerFast.from_pretrained(self.translation_model_name)
 
   def vlm_summary(self, angle, video_data):
+    print("vlm summary start")
     question = "영상은 현재 " + angle + "을 비추고 있는 카메라 영상입니다." \
     "서정적인 표현을 제외하고 영상 내용을 간결하게 요약해 주세요. " \
     "자동차 사고 및 사상자가 포함된 경우 상황을 포함하여 요약해 주세요. " \

@@ -192,6 +192,7 @@ class KeyFrameExtractor:
     def process(self, video_data, camera_id, frame_queue):
         video_uuid = str(uuid.uuid4())
         output_path = f"{ORIGINAL_VIDEOS}/{video_uuid}.mp4"
+        print(f"{output_path} keyframe extract")
         video_bytes = video_data.read()
         container, video_stream, fps_int = self.open_video(video_bytes)
         output, out_stream = self.init_new_segment_output(video_stream, output_path)
@@ -201,7 +202,8 @@ class KeyFrameExtractor:
         first_gray_frame = self.get_first_gray_frame(video_bytes)
         if is_new:
             prev_gray_resized, mean_frame = self.fill_windows(first_gray_frame, container, fps_int, flow_window, mse_window)
-            
+        print("camera checking done")
+
         cur_window_size = len(mse_window)
         flow_threshold, mse_threshold, min_mse_threshold, max_mse_threshold, recovery_factor, relax_factor = self.set_segment_factors(mse_window, flow_window)
         prev_gray_resized = first_gray_frame
@@ -209,6 +211,7 @@ class KeyFrameExtractor:
         frame_index = 0
         segment_idx = 0
         selected_count = 0
+        print("frame extract start")
         for frame in container.decode(video=0):
             if frame_index % fps_int != 0:
                 frame_index += 1
@@ -226,7 +229,8 @@ class KeyFrameExtractor:
                 print(f"[Segment {segment_idx}] flow_th: {flow_threshold:.2f}, mse_th: {mse_threshold:.2f}, min_mse_th: {min_mse_threshold:.2f}, "
                         f"max_mse_th: {max_mse_threshold:.2f}, relax: {relax_factor:.4f}, recover: {recovery_factor:.4f}")
                 segment_idx += 1
-
+            
+            print(f"{frame_index}")
             gray_resized = self.convert_gray_and_resize(frame)
             mse = self.get_mse(mean_frame, gray_resized)
             cur_flow = self.get_cur_flow(prev_gray_resized, gray_resized)
