@@ -1,6 +1,6 @@
 from flask import Flask
 from app.extension import db
-from dotenv import load_dotenv
+#from dotenv import load_dotenv
 import os
 from flask_sqlalchemy import SQLAlchemy
 from app.Config import *
@@ -13,8 +13,7 @@ from app.util.backendClient import BackendClient
 
 from app.routes.process_route import video_bp
 
-
-load_dotenv()
+#load_dotenv()
 
 def create_app():
     app = Flask(__name__)

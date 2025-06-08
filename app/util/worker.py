@@ -1,17 +1,18 @@
 import asyncio
-from flask import current_app
 from concurrent.futures import ThreadPoolExecutor
 from app.util.backendClient import *
 from queue import Queue
 
-def run_pipeline(video_data, camera_id):
+def run_pipeline(video_data, camera_id, app):
+    print("run_pipeline")
+
     frame_queue = Queue()
     yolo_queue = Queue()
 
-    keyframe_extractor = current_app.key_frame_extractor
-    tracker = current_app.tracker
-    vlm = current_app.vlm
-    backend_client = current_app.backent_client
+    keyframe_extractor = app.key_frame_extractor
+    tracker = app.tracker
+    vlm = app.vlm
+    backend_client = app.backent_client
 
     start_time = "2025-06-07T12:00:00Z"
     thumbnail_url = f"s3://somebucket/thumbnails/{camera_id}.jpg"
