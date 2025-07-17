@@ -6,3 +6,6 @@ Yolov7_StrongSORT_OSNet/
 
 app/extracted_videos/
 app/yolo_crops/
+
+poc/tracking_module/sample.mp4
+poc/tracking_module/yolo11m.engine
