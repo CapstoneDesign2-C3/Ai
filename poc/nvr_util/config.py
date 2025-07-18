@@ -5,11 +5,11 @@ from datetime import datetime
 
 NVR_ENDPOINTS: List[Dict] = [
     {
-        "name": "MainNVR",
-        "host": "192.168.1.100",
+        "name": "test_nvr",
+        "host": "192.168.5.99",
         "port": 554,
-        "username": "admin",
-        "password": "password",
+        "username": "Admin",
+        "password": "hiperwall2018",
         "protocol": "RTSP",       # or "ONVIF"
         "channels": ["1", "2", "3", "4"]
     },
