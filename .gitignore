@@ -1,4 +1,4 @@
-.env
+*.env
 __pycache__
 temp/
 venv_ai_server
