@@ -1,0 +1,15 @@
+# rtsp-simple-server/config.yml
+
+# 8554 포트에서 RTSP Relay
+paths:
+  all:
+    # 인증은 외부에서 처리하므로 단순 Relay
+    source: record          # 미리 NVR 원본을 fetch 하려면 publisher
+    runOnReady:             # publisher 모드 예시 (Live 갱신)
+      # ffmpeg -re -i rtsp://<NVR> ... -f rtsp rtsp://localhost:8554/{path}
+      - ffmpeg -re -i "rtsp://{{ .Source }}/cam/realmonitor?channel={{ .Path }}&subtype=0" \
+               -c copy -f rtsp rtsp://localhost:8554/{{ .Path }}
+    runOnDemand:            # on-demand publisher
+      # playback 요청 시 동적으로 mount
+      - ffmpeg -i "rtsp://{{ .Source }}/cam/playback?channel={{ .Path }}&starttime={{ .Extra.start }}&endtime={{ .Extra.end }}&subtype=0" \
+               -c copy -f rtsp rtsp://localhost:8554/{{ .Path }}
