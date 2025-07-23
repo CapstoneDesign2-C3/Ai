@@ -1,16 +1,21 @@
-# nvr_util/exceptions.py
 
 class NVRError(Exception):
-    pass
+    """NVR 관련 기본 예외 클래스"""
+    def __init__(self, message="NVR error occurred"):
+        super().__init__(message)
+        self.message = message
 
 class NVRConnectionError(NVRError):
-    def __init__(self):
-        super.__init__('NVR 연결에 실패하였습니다.')
+    """NVR 연결 관련 예외 클래스"""
+    def __init__(self, message="NVR connection failed"):
+        super().__init__(message)
 
 class NVRAuthError(NVRError):
-    def __init__(self):
-        super.__init__('인증 과정에서 오류가 발생하였습니다.')
+    """NVR 인증 관련 예외 클래스"""
+    def __init__(self, message="NVR authentication failed"):
+        super().__init__(message)
 
 class NVRChannelNotFoundError(NVRError):
-    def __init__(self):
-        super.__init__('NVR 채널을 찾을 수 없습니다.')
+    """NVR 채널을 찾을 수 없을 때의 예외 클래스"""
+    def __init__(self, message="NVR channel not found"):
+        super().__init__(message)

@@ -9,3 +9,6 @@ app/yolo_crops/
 
 poc/tracking_module/sample.mp4
 poc/tracking_module/yolo11m.engine
+
+poc/nvr_util/config.py
+
