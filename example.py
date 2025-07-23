@@ -8,7 +8,7 @@ try:
     from datetime import datetime
     
     # 1) 클라이언트 초기화
-    client = NVRClient(name="rtsp")
+    client = NVRClient(name="http")
     
     # 2) 채널 목록 조회
     channels = client.list_channels()
