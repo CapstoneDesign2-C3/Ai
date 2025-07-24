@@ -10,9 +10,9 @@ class NVRConnectionError(NVRError):
     def __init__(self, message="NVR connection failed"):
         super().__init__(message)
 
-class NVRAuthError(NVRError):
-    """NVR 인증 관련 예외 클래스"""
-    def __init__(self, message="NVR authentication failed"):
+class NVRRecieveError(NVRError):
+    """NVR 프레임 전송 관련 예외 클래스"""
+    def __init__(self, message="NVR data receiving failed"):
         super().__init__(message)
 
 class NVRChannelNotFoundError(NVRError):

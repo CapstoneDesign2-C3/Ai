@@ -39,3 +39,22 @@ class PostgreSQL:
                 (detected_object_id, appeared_time, exit_time)
             )
             self.db.commit()
+
+    def getCameraInfo(self):
+        with self.db.cursor() as cursor:
+            cursor.execute(
+                "SELECT camera_id, camera_ip, camera_port, stream_path, rtsp_id, rtsp_password FROM camera_info"
+            )
+            rows = cursor.fetchall()
+
+        camera_list = []
+        for row in rows:
+            camera_list.append({
+                "camera_id": row[0],
+                "camera_ip": row[1],
+                "camera_port": row[2],
+                "stream_path": row[3],
+                "rtsp_id": row[4],
+                "rtsp_password": row[5],
+            })
+        return camera_list
