@@ -4,6 +4,7 @@ import uuid
 from poc.db_util.db_util import PostgreSQL
 from dotenv import load_dotenv
 import os
+import time
 
 class NVRChannel:
     def __init__(self, camera_id, camera_ip, camera_port, stream_path, rtsp_id, rtsp_password):
@@ -31,6 +32,9 @@ class NVRChannel:
         self.cap.release()
         
     def receive(self):
+        last_sent = 0
+        send_interval = 1 / 5
+
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -39,7 +43,12 @@ class NVRChannel:
             if self.isRecording:
                 self.out.write(frame)
 
-            #TODO Kafka producer에 {camera_id, frame} 형태로 데이터 전달
+            ## 5fps 전송을 위한 부분
+            now = time.time()
+            if now - last_sent >= send_interval:
+                #TODO Kafka producer에 {camera_id, frame} 형태로 데이터 전달
+                last_sent = now
+
 
 
     def startRecord(self):
