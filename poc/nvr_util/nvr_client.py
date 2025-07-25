@@ -2,6 +2,7 @@ import cv2
 from poc.nvr_util.exceptions import NVRConnectionError, NVRRecieveError
 import uuid
 from poc.db_util.db_util import PostgreSQL
+from poc.kafka_util.frame_producer import *
 from dotenv import load_dotenv
 import os
 import time
@@ -15,6 +16,7 @@ class NVRChannel:
         self.rtsp_id = rtsp_id
         self.rtsp_password = rtsp_password
         self.isRecording = False
+        self.frame_producer = FrameProducer()
 
     def connect(self):
         rtsp_live_url = f'rtsp://{self.rtsp_id}:{self.rtsp_password}@{self.camera_ip}:{self.camera_port}{self.stream_path}'
@@ -48,7 +50,9 @@ class NVRChannel:
             if now - last_sent >= send_interval:
                 #TODO Kafka producer에 {camera_id, frame} 형태로 데이터 전달
                 last_sent = now
-
+            
+            # send to kafka
+            self.frame_producer.send_message(self.camera_id, frame)
 
 
     def startRecord(self):
