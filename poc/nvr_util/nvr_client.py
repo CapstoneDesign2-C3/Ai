@@ -50,9 +50,9 @@ class NVRChannel:
             if now - last_sent >= send_interval:
                 #TODO Kafka producer에 {camera_id, frame} 형태로 데이터 전달
                 last_sent = now
-            
-            # send to kafka
-            self.frame_producer.send_message(self.camera_id, frame)
+
+                # send to kafka
+                self.frame_producer.send_message(self.camera_id, frame)
 
 
     def startRecord(self):
@@ -66,7 +66,7 @@ class NVRChannel:
 
         return self.file_name
     
-class NVRClinet:
+class NVRClient:
     def __init__(self):
         dotenv_path = 'env/aws.env'
         load_dotenv(dotenv_path)

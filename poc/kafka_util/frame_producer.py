@@ -9,9 +9,9 @@ class FrameProducer:
         dotenv_path = 'env/aws.env'
         load_dotenv(dotenv_path)
         self.broker = os.getenv('BROKER')
-        self.topic = os.getnev('TOPIC')
+        self.topic = os.getenv('FRAME_TOPIC')
         self.producer = KafkaProducer(bootstrap_servers=self.broker,
-                                      value_serializer=lambda x: json.dumps(x).encode('utf-8'),
+                                      value_serializer=lambda x: x,
                                       acks=0,
                                       api_version=(2,5,0),
                                       retries=3
@@ -27,12 +27,12 @@ class FrameProducer:
             jpeg_bytes = buffer.tobytes()
 
             self.producer.send(
-            'camera-frames',
+            self.topic,
             key=str(cameraID).encode('utf-8'),
             value=jpeg_bytes
             )
             self.producer.flush()   # 비우는 작업
-
+            print(f"[Kafka] Sent frame from camera {cameraID} to topic {self.topic}")
             return {'status_code': 200, 'error': None}
         except Exception as e:
             print("Error: Sending Error", e)
