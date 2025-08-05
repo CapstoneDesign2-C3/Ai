@@ -1,8 +1,8 @@
 import cv2
-from poc.nvr_util.exceptions import NVRConnectionError, NVRRecieveError
+from nvr_util.exceptions import NVRConnectionError, NVRRecieveError
 import uuid
-from poc.db_util.db_util import PostgreSQL
-from poc.kafka_util.frame_producer import *
+from db_util.db_util import PostgreSQL
+from kafka_util import producers
 from dotenv import load_dotenv
 import os
 import time
@@ -16,7 +16,7 @@ class NVRChannel:
         self.rtsp_id = rtsp_id
         self.rtsp_password = rtsp_password
         self.isRecording = False
-        self.frame_producer = FrameProducer()
+        self.frame_producer = producers.FrameProducer(self.camera_id)
 
     def connect(self):
         rtsp_live_url = f'rtsp://{self.rtsp_id}:{self.rtsp_password}@{self.camera_ip}:{self.camera_port}{self.stream_path}'
@@ -68,7 +68,7 @@ class NVRChannel:
     
 class NVRClient:
     def __init__(self):
-        dotenv_path = 'env/aws.env'
+        dotenv_path = '/home/hiperwall/Ai_modules/Ai/env/aws.env'
         load_dotenv(dotenv_path)
         db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'), os.getenv('DB_USER'), os.getenv('DB_PASSWORD'), os.getenv('DB_PORT'))
         camera_list = db.getCameraInfo()
