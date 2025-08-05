@@ -31,6 +31,7 @@ class FrameProducer:
             key=str(cameraID).encode('utf-8'),
             value=jpeg_bytes
             )
+            # 1frame 1flush is it ok?
             self.producer.flush()   # 비우는 작업
             print(f"[Kafka] Sent frame from camera {cameraID} to topic {self.topic}")
             return {'status_code': 200, 'error': None}
