@@ -10,18 +10,21 @@ import faiss
 from kafka import KafkaConsumer, KafkaProducer
 from dotenv import load_dotenv
 from torchvision import transforms
+from poc.db_util.db_util import PostgreSQL
 from PIL import Image
 import torchreid
 import logging
 
 class ReIDService:
-    def __init__(self):
+    def __init__(self, db: PostgreSQL):
         # Load environment variables
         load_dotenv('env/aws.env')
         self.broker = os.getenv('BROKER')
         self.request_topic = os.getenv('REID_REQUEST_TOPIC')
-        self.response_topic = os.getenv('REID_RESPONSE_TOPIC')
         
+        #DB
+        self.db = db
+
         # Device setup
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         
@@ -98,7 +101,7 @@ class ReIDService:
             self.logger.error(f"Feature extraction failed: {e}")
             raise
     
-    def assign_global_id(self, feat_vec: np.ndarray) -> int:
+    def assign_global_id(self, feat_vec: np.ndarray, img) -> int:
         """Assign global ID using FAISS similarity search"""
         try:
             # L2 normalize feature vector
@@ -115,6 +118,8 @@ class ReIDService:
             # Create new global ID for new person
             new_id = uuid.uuid4().int & ((1<<63)-1)
             self.index.add_with_ids(feat_vec, np.array([new_id], dtype='int64'))
+            # TODO feature 저장 방법 고민
+            self.db.addNewDetectedObject(uuid=new_id, crop_img=img)
             return new_id
             
         except Exception as e:
@@ -123,36 +128,32 @@ class ReIDService:
     
     def process_reid_request(self, data: dict) -> dict:
         """Process single ReID request"""
-        cam_id = data.get('camera_id')
-        local_id = data.get('local_id')
-        ts = data.get('timestamp')
-        b64 = data.get('crop_jpg', '')
+        camera_id = data.get('camera_id')
+        image_base64 = data.get('crop_jpg', '')
         
         try:
             # Decode crop image
-            img_data = base64.b64decode(b64)
+            img_data = base64.b64decode(image_base64)
             img = Image.open(io.BytesIO(img_data)).convert('RGB')
         except Exception as e:
-            self.logger.error(f"Invalid crop image from cam={cam_id}, local_id={local_id}: {e}")
+            self.logger.error(f"Invalid crop image from cam={camera_id} : {e}")
             raise
         
         # Extract feature and assign global ID
         start = time.perf_counter()
-        feat = self.extract_feature(img)
-        global_id = self.assign_global_id(feat)
+        feature_vector = self.extract_feature(img)
+        global_id = self.assign_global_id(feature_vector, img)
         elapsed = time.perf_counter() - start
         
+        # TODO addNewDetection 메소드 통해 db에 동선 저장, db.addNewDetection(self, uuid, appeared_time, exit_time)
+
         # Prepare response
         response = {
-            'camera_id': cam_id,
-            'local_id': local_id,
-            'timestamp': ts,
-            'global_id': global_id,
-            'elapsed': elapsed,
-            'status': 'success'
+            'camera_id': camera_id,
+            'global_id': global_id
         }
-        
-        self.logger.info(f"[ReID] cam={cam_id} local={local_id} -> global={global_id} ({elapsed:.3f}s)")
+
+        self.logger.info(f"[ReID] cam={camera_id}  -> global={global_id} ({elapsed:.3f}s)")
         return response
     
     def send_response(self, response: dict):
@@ -205,5 +206,8 @@ class ReIDService:
         self.logger.info("ReID service shutdown complete")
 
 if __name__ == "__main__":
-    service = ReIDService()
+    dotenv_path = '/home/hiperwall/Ai_modules/Ai/env/aws.env'
+    load_dotenv(dotenv_path)
+    db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'), os.getenv('DB_USER'), os.getenv('DB_PASSWORD'), os.getenv('DB_PORT'))
+    service = ReIDService(db=db)
     service.run()
