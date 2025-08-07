@@ -6,7 +6,7 @@ class PostgreSQL:
             host=host, dbname=dbname, user=user, password=password, port=port
         )
 
-    def addNewDetectedObject(self, uuid, crop_img_url, feature, code_name):
+    def addNewDetectedObject(self, uuid, crop_img, feature="", code_name="사람"):
         with self.db.cursor() as cursor:
             cursor.execute(
                 "SELECT code_id FROM event_codes WHERE code_name = %s",
@@ -18,8 +18,8 @@ class PostgreSQL:
             code_id = result[0]
 
             cursor.execute(
-                "INSERT INTO detected_object (uuid, crop_img_url, feature, code_id) VALUES (%s, %s, %s, %s)",
-                (uuid, crop_img_url, feature, code_id)
+                "INSERT INTO detected_object (uuid, crop_img, feature, code_id) VALUES (%s, %s, %s, %s)",
+                (uuid, psycopg2.Binary(crop_img), feature, code_id)
             )
             self.db.commit()
 
