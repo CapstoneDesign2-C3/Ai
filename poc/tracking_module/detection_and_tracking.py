@@ -30,8 +30,8 @@ class DetectorAndTracker:
         load_dotenv(override=True)
 
         # --- Kafka ---
-        self.frame_consumer = consumers.FrameConsumer()
-        self.result_producer = producers.DetectedResultProducer()
+        self.frame_consumer = consumers.FrameConsumer(camera_id=cameraID)
+        self.result_producer = producers.create_track_result_producer(camera_id=cameraID)
         # self.track_result_producer = producers.TrackResultProducer(cameraID=cameraID)
 
         # --- 로컬 ID 세트 ---

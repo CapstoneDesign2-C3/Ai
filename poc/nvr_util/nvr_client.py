@@ -6,6 +6,9 @@ from kafka_util import producers
 from dotenv import load_dotenv
 import os
 import time
+import logging
+
+logger = logging.getLogger(__name__)
 
 class NVRChannel:
     def __init__(self, camera_id, camera_ip, camera_port, stream_path, rtsp_id, rtsp_password):
@@ -16,7 +19,7 @@ class NVRChannel:
         self.rtsp_id = rtsp_id
         self.rtsp_password = rtsp_password
         self.isRecording = False
-        self.frame_producer = producers.FrameProducer(self.camera_id)
+        self.frame_producer = producers.create_frame_producer(self.camera_id)
 
     def connect(self):
         rtsp_live_url = f'rtsp://{self.rtsp_id}:{self.rtsp_password}@{self.camera_ip}:{self.camera_port}{self.stream_path}'
@@ -29,30 +32,48 @@ class NVRChannel:
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
         self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        print("successfully connected.\n")
 
     def disconnect(self):
         self.cap.release()
-        
+    
     def receive(self):
-        last_sent = 0
-        send_interval = 1 / 5
+        # 5 FPS
+        send_count = 0
+        send_interval = 1.0 / 5.0
+        next_send_at = time.monotonic()  # monotonic clock
+
+        consecutive_fail = 0
+        MAX_FAIL = 50  # 연속 실패 허용치 (상황에 맞게 조정)
 
         while True:
             ret, frame = self.cap.read()
-            if not ret:
-                raise NVRRecieveError("프레임 읽기 실패")
+            if not ret or frame is None:
+                consecutive_fail += 1
+                if consecutive_fail >= MAX_FAIL:
+                    raise NVRRecieveError(f"프레임 연속 {MAX_FAIL}회 읽기 실패")
+                time.sleep(0.02)  # 잠깐 쉬고 재시도
+                continue
+            consecutive_fail = 0
 
-            if self.isRecording:
-                self.out.write(frame)
+            # 선택: 녹화 중이면 파일에도 저장
+            if getattr(self, "isRecording", False):
+                try:
+                    self.out.write(frame)
+                except Exception as e:
+                    logger.warning(f"Recording write 실패: {e}")
 
-            ## 5fps 전송을 위한 부분
-            now = time.time()
-            if now - last_sent >= send_interval:
-                #TODO Kafka producer에 {camera_id, frame} 형태로 데이터 전달
-                last_sent = now
-
-                # send to kafka
-                self.frame_producer.send_message(self.camera_id, frame)
+            try:
+                # Kafka로 JPEG bytes 전송 (key=camera_id, value=bytes)
+                # 주의: FrameProducer.send_message 내부에서 flush를 매번 하지 않는 것을 권장
+                res = self.frame_producer.send_message(frame=frame)
+                send_count += 1
+                if send_count % 10 == 0:  # 10프레임마다 한 번
+                    logger.info(f"[NVR] sent {send_count} frames from {self.camera_id}")
+                if isinstance(res, dict) and res.get('status_code') != 200:
+                    logger.error(f"Kafka send 실패: {res}")
+            except Exception as e:
+                logger.error(f"❌ 프레임 전송 실패: {e}")
 
 
     def startRecord(self):

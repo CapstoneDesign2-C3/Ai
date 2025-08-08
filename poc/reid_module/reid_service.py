@@ -10,7 +10,7 @@ import faiss
 from kafka import KafkaConsumer, KafkaProducer
 from dotenv import load_dotenv
 from torchvision import transforms
-from poc.db_util.db_util import PostgreSQL
+from db_util.db_util import PostgreSQL
 from PIL import Image
 import torchreid
 import logging

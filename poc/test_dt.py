@@ -2,7 +2,7 @@ import os
 import cv2
 import time
 from dotenv import load_dotenv
-from detection_and_tracking import DetectorAndTracker
+from poc.tracking_module.detection_and_tracking import DetectorAndTracker
 
 def main():
     # 1) ENV 세팅: TensorRT 엔진(.plan) 경로를 지정
