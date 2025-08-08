@@ -1,6 +1,7 @@
 import os, time, cv2, numpy as np
 from dotenv import load_dotenv
 from nvr_util import nvr_client
+from tracking_module.detection_and_tracking import DetectorAndTracker 
 
 def load_env():
     for p in (os.getenv("DOTENV_PATH"),
@@ -46,7 +47,7 @@ def main():
     client = nvr_client.NVRClient()
     channel = client.NVRChannelList[0]
     channel.connect()
-
+    camera_id = channel.camera_id
     # FFMPEG 백엔드로 강제
     cap = channel.cap
 
@@ -81,6 +82,8 @@ def main():
     win = "RTSP Preview (press q to quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
+    detector = DetectorAndTracker(cameraID=camera_id)
+
     cnt, t1 = 0, time.time()
     try:
         while True:
@@ -90,14 +93,19 @@ def main():
                 time.sleep(0.05)
                 continue
 
-            cnt += 1
-            now = time.time()
-            if now - t1 >= 1.0:
-                fps = cnt / (now - t1)
-                print(f"[RTSP] recv fps ~ {fps:.1f}")
-                cnt, t1 = 0, now
+            detector.detect_and_track(frame, debug=False)
 
-            cv2.imshow(win, frame)
+            # b) 시각화: infer → draw_detections 순으로 별도 처리
+            boxes, scores, class_ids, timings = detector.infer(frame)
+            vis = detector.draw_detections(frame, boxes, scores, class_ids)
+
+            # c) 처리 시간 출력
+            total_ms = (timings['total'] * 1000)
+            cv2.putText(vis, f"Time: {total_ms:.1f} ms", (10, 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2)
+
+            # d) 결과 디스플레이
+            cv2.imshow('Detection & Tracking', vis)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
     finally:
