@@ -2,7 +2,7 @@ import numpy as np
 import cv2
 import tensorrt as trt
 import pycuda.driver as cuda
-import pycuda.autoinit
+# import pycuda.autoinit
 import time
 import json
 from pathlib import Path
@@ -18,6 +18,10 @@ class TensorRTYOLOv11:
             conf_threshold: 신뢰도 임계값
             iou_threshold: IoU 임계값
         """
+        # no autoinit for collision of context
+        cuda.init()
+        self.cuda_ctx = cuda.Device(0).make_context()
+
         self.engine_path = engine_path
         self.conf_threshold = conf_threshold
         self.iou_threshold = iou_threshold

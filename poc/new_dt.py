@@ -405,7 +405,67 @@ class DetectorAndTracker:
         except Exception as e:
             print(f"❌ 추론 실행 오류: {e}")
             return np.array([]), np.array([]), np.array([]), {}
-
+    def infer(self, image, debug=False):
+        """추론 실행"""
+        # 전처리
+        start_time = time.time()
+        input_tensor, scale, pad_x, pad_y = self.preprocess(image)
+        preprocess_time = time.time() - start_time
+        
+        if debug:
+            print(f"🔍 추론 디버그:")
+            print(f"   - 입력 이미지 크기: {image.shape}")
+            print(f"   - 전처리된 텐서 크기: {input_tensor.shape}")
+            print(f"   - 스케일: {scale:.3f}, 패딩: ({pad_x}, {pad_y})")
+        
+        # GPU로 데이터 복사
+        start_time = time.time()
+        np.copyto(self.inputs[0]['host'], input_tensor.ravel())
+        cuda.memcpy_htod_async(self.inputs[0]['device'], self.inputs[0]['host'], self.stream)
+        
+        # TensorRT 버전에 따른 추론 실행 (최적화된 버전)
+        try:
+            # execute_async_v3 우선 사용 (가장 빠름)
+            if hasattr(self.context, 'execute_async_v3'):
+                # 텐서 주소 설정
+                self.context.set_tensor_address(self.input_name, self.inputs[0]['device'])
+                for output in self.outputs:
+                    self.context.set_tensor_address(output['name'], output['device'])
+                # 비동기 실행
+                self.context.execute_async_v3(stream_handle=self.stream.handle)
+            else:
+                # 폴백: execute_v2 사용 (동기)
+                self.context.execute_v2(bindings=self.bindings)
+        except Exception as e:
+            print(f"추론 실행 오류: {e}")
+            # 최종 폴백
+            self.context.execute_v2(bindings=self.bindings)
+        
+        # 결과를 CPU로 복사
+        for output in self.outputs:
+            cuda.memcpy_dtoh_async(output['host'], output['device'], self.stream)
+        
+        self.stream.synchronize()
+        inference_time = time.time() - start_time
+        
+        # 후처리
+        start_time = time.time()
+        output_data = [output['host'].reshape(output['shape']) for output in self.outputs]
+        
+        if debug:
+            print(f"   - 추론 시간: {inference_time*1000:.1f}ms")
+            for i, data in enumerate(output_data):
+                print(f"   - 출력 {i} 통계: min={np.min(data):.3f}, max={np.max(data):.3f}, mean={np.mean(data):.3f}")
+        
+        boxes, scores, class_ids = self.postprocess(output_data, scale, pad_x, pad_y, debug)
+        postprocess_time = time.time() - start_time
+        
+        return boxes, scores, class_ids, {
+            'preprocess': preprocess_time,
+            'inference': inference_time,
+            'postprocess': postprocess_time,
+            'total': preprocess_time + inference_time + postprocess_time
+        }
     def preprocess(self, image: np.ndarray) -> Tuple[np.ndarray, float, int, int]:
         """이미지 전처리"""
         input_h, input_w = self.input_shape[2], self.input_shape[3]

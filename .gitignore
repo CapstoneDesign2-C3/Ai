@@ -12,3 +12,4 @@ poc/tracking_module/yolo11m.engine
 
 poc/nvr_util/config.py
 poc/yolo_engine
+poc/sample.mp4
