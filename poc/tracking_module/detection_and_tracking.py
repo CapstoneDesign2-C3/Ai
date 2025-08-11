@@ -339,7 +339,7 @@ class DetectorAndTracker:
                 embs.append(np.full(128, 1.0 / np.sqrt(128), np.float32))
         return np.vstack(embs) if embs else None
 
-    def detect_and_track(self, frame, debug=False):
+    def detect_and_track(self, frame, debug=False, return_vis=False):
         # 0) Inference
         boxes, scores, class_ids, timing_info = self.infer(frame, debug)
         if debug:
@@ -410,7 +410,13 @@ class DetectorAndTracker:
 
             # self.track_result_producer.send_message(crop)  # 필요시 전송
             self.local_id_set.add(tid)
-
+        
+        # 5) return_vis = True인 경우 시각화 프레임 return 
+        vis = None
+        if return_vis:
+            vis = self.draw_detections(frame, boxes, scores, class_ids)
+        return (vis, timing_info) if return_vis else None
+    
     def draw_detections(self, image, boxes, scores, class_ids, debug=False):
         if debug:
             print(f"🎨 그리기 디버그: 이미지={image.shape}, 박스={len(boxes)}")
