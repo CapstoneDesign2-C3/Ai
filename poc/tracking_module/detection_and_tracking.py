@@ -342,6 +342,7 @@ class DetectorAndTracker:
     def detect_and_track(self, frame, debug=False, return_vis=False):
         # 0) Inference
         boxes, scores, class_ids, timing_info = self.infer(frame, debug)
+       
         if debug:
             print(f"Inference timing: {timing_info}")
 
@@ -350,6 +351,8 @@ class DetectorAndTracker:
         detections = []
         object_chips = []
         for box, score, class_id in zip(boxes, scores, class_ids):
+            if int(class_id) != 0: # 사람만 필터링
+                continue
             x1, y1, w, h = box
             x1 = int(round(x1)); y1 = int(round(y1))
             w = int(round(w)); h = int(round(h))
@@ -414,9 +417,31 @@ class DetectorAndTracker:
         # 5) return_vis = True인 경우 시각화 프레임 return 
         vis = None
         if return_vis:
-            vis = self.draw_detections(frame, boxes, scores, class_ids)
-        return (vis, timing_info) if return_vis else None
+            vis = self.draw_tracks(frame, tracks)
+
+        return (
+            vis, 
+            timing_info, 
+            boxes, scores, class_ids, 
+            tracks
+        )
     
+    def draw_tracks(self, image, tracks):
+        vis = image.copy()
+        H, W = vis.shape[:2]
+        for t in tracks:
+            if not t.is_confirmed(): 
+                continue
+            l, t0, r, b = map(int, t.to_ltrb())
+            l = max(0, min(l, W-1)); r = max(0, min(r, W-1))
+            t0 = max(0, min(t0, H-1)); b = max(0, min(b, H-1))
+            if r <= l or b <= t0: 
+                continue
+            cv2.rectangle(vis, (l, t0), (r, b), (0,255,0), 2)
+            cv2.putText(vis, f'ID:{t.track_id}', (l, max(0, t0-5)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        return vis
+
     def draw_detections(self, image, boxes, scores, class_ids, debug=False):
         if debug:
             print(f"🎨 그리기 디버그: 이미지={image.shape}, 박스={len(boxes)}")
