@@ -3,6 +3,18 @@ import cv2
 import time
 from dotenv import load_dotenv
 from poc.tracking_module.detection_and_tracking import DetectorAndTracker
+import os
+import time
+import threading
+import cv2
+import numpy as np
+from dotenv import load_dotenv
+
+
+from nvr_util.nvr_client import NVRChannel, NVRClient  # requires nvr_util, db_util packages to be importable
+
+# 우리가 앞서 만든 프레임 컨슈머 (프레임 ← Kafka 수신 담당)
+from kafka_util.consumers import create_frame_consumer
 
 def main():
     # 1) ENV 세팅: TensorRT 엔진(.plan) 경로를 지정
@@ -27,7 +39,10 @@ def main():
     #    실제 ReID 모델이 없다면, 더미 임베딩으로 대체
     #    detector.embedder = DummyEmbedder()  # 실제 구현체로 교체
     detector.embedder = lambda crops: [ [0.0]*128 for _ in crops ]
-
+    client = NVRClient()
+    channel = client.NVRChannelList[0]
+    channel.connect()
+    
     # 4) 비디오 열기
     cap = cv2.VideoCapture('sample.mp4')
     if not cap.isOpened():

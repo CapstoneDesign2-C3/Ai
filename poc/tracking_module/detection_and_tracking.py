@@ -5,6 +5,7 @@ import atexit
 from contextlib import contextmanager
 from pathlib import Path
 
+import threading    
 import numpy as np
 import cv2
 import tensorrt as trt
@@ -14,6 +15,7 @@ import torch
 from dotenv import load_dotenv
 from kafka_util import consumers, producers
 from deep_sort_realtime.deepsort_tracker import DeepSort
+from db_util.db_util import PostgreSQL
 
 # (extract_crop_from_frame에서 사용)
 from PIL import Image
@@ -36,6 +38,15 @@ class DetectorAndTracker:
 
         # --- 로컬 ID 세트 ---
         self.local_id_set = set()
+        self.pending_reid = set()        # 전송했지만 응답 대기
+        self.local_to_global = {}        # local_id -> global_id
+        self.track_start_ts = {}         # local_id -> appeared_time(ms)
+
+        self.db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'),
+                             os.getenv('DB_USER'), os.getenv('DB_PASSWORD'), os.getenv('DB_PORT'))
+        
+        self.reid_consumer = consumers.create_reid_response_consumer(cameraID, handler=self.on_reid_response)
+        threading.Thread(target=self.reid_consumer.run, daemon=True).start()
 
         # --- CUDA 컨텍스트: primary retain만, push/pop은 with 블록에서 ---
         _ = torch.zeros(1, device='cuda')     # Torch로 primary context 생성 트리거
@@ -60,7 +71,18 @@ class DetectorAndTracker:
             self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
 
         # --- DeepSORT ---
-        self.tracker = DeepSort(max_age=5)
+        self.tracker = DeepSort(
+                                max_age=120,                 # 20frames ≈ 0.67s
+                                n_init=3,                   # 초기 확정 3프레임
+                                max_cosine_distance=0.25,   # appearance threshold
+                                nn_budget=80,               # appearance history 상한
+                                embedder_gpu=True,
+                                half=True,
+                                bgr=True,
+                                polygon=False,
+                                nms_max_overlap=1.0         # detector가 NMS 충분하면 1.0(=OFF)
+                            )
+
         
         # 안전한 CPU 임베더(0벡터/NaN 방지)
         self.embedder = self._cpu_embedder_safe
@@ -124,6 +146,14 @@ class DetectorAndTracker:
         except Exception as e:
             print(f"❌ 엔진 로드 실패: {e}")
             raise
+
+    def on_reid_response(self, data: dict):
+        """REID_RESPONSE_TOPIC 수신 핸들러"""
+        gid = int(data.get("global_id", -1))
+        lid = int(data.get("local_id", data.get("track_id", -1)))
+        if gid > 0 and lid >= 0:
+            self.local_to_global[lid] = gid
+            self.pending_reid.discard(lid)
 
     def _allocate_buffers(self):
         inputs, outputs, bindings = [], [], []
@@ -203,60 +233,106 @@ class DetectorAndTracker:
         input_tensor = np.expand_dims(input_tensor, axis=0)
         return input_tensor, scale, pad_x, pad_y
 
+    # detection_and_tracking.py
+
     def postprocess(self, outputs, scale, pad_x, pad_y, debug=False):
-        if debug:
-            print(f"🔍 후처리 디버그: 출력 {len(outputs)}개")
+        t_pp0 = time.perf_counter()
 
         out = outputs[0]
-        if len(out.shape) == 3:
+        if out.ndim == 3:
             out = out[0]
             if out.shape[0] < out.shape[1]:
-                out = out.T  # (84,8400)->(8400,84)
+                out = out.T
+        out = np.asarray(out, dtype=np.float32, order='C')
 
-        boxes, scores, class_ids = [], [], []
-        for i, det in enumerate(out):
-            x_center, y_center, width, height = det[:4]
-            class_confs = det[4:]
-            max_conf = float(np.max(class_confs))
-            if max_conf <= self.conf_threshold:
-                continue
-            class_id = int(np.argmax(class_confs))
+        # ---- 1) parsing (사람 클래스만 사용) ----
+        t_parse0 = time.perf_counter()
+        cls = out[:, 4:]                 # (N, num_classes)
+        scores = cls[:, 0]               # person 점수만
+        class_ids = np.zeros_like(scores, dtype=np.int32)
 
-            # pad/scale 보정
-            x_center = (x_center - pad_x) / scale
-            y_center = (y_center - pad_y) / scale
-            width = width / scale
-            height = height / scale
+        mask = scores > self.conf_threshold
+        if not np.any(mask):
+            t_parse1 = time.perf_counter()
+            t_pp1 = time.perf_counter()
+            return (
+                np.empty((0, 4), np.float32),
+                np.empty((0,),  np.float32),
+                np.empty((0,),  np.int32),
+                {
+                    "parse": (t_parse1 - t_parse0),
+                    "nms": 0.0,
+                    "postprocess": (t_pp1 - t_pp0),
+                }
+            )
 
-            x1 = x_center - width / 2
-            y1 = y_center - height / 2
-            boxes.append([x1, y1, width, height])
-            scores.append(max_conf)
-            class_ids.append(class_id)
+        b = out[mask, :4]
+        scores = scores[mask]
+        class_ids = class_ids[mask]
 
-        if not boxes:
-            return [], [], []
+        # 벡터화된 보정 + 좌상단 기준 변환
+        x_c, y_c, w, h = b[:, 0], b[:, 1], b[:, 2], b[:, 3]
+        x = (x_c - pad_x) / scale
+        y = (y_c - pad_y) / scale
+        w = w / scale
+        h = h / scale
+        x1 = x - 0.5 * w
+        y1 = y - 0.5 * h
+        boxes_xywh = np.stack([x1, y1, w, h], axis=1).astype(np.float32)
+        t_parse1 = time.perf_counter()
 
-        boxes = np.array(boxes)
-        scores = np.array(scores)
-        class_ids = np.array(class_ids)
+        # Top-K로 후보 캡 (선택적으로 조정)
+        K = 300
+        if scores.shape[0] > K:
+            idx_topk = np.argpartition(scores, -K)[-K:]
+            boxes_xywh = boxes_xywh[idx_topk]
+            scores     = scores[idx_topk]
+            class_ids  = class_ids[idx_topk]
 
-        indices = cv2.dnn.NMSBoxes(boxes.tolist(), scores.tolist(),
-                                   self.conf_threshold, self.iou_threshold)
-        if len(indices) > 0:
-            if isinstance(indices, tuple):
-                indices = indices[0] if len(indices) > 0 else []
-            if len(indices) > 0:
-                indices = indices.flatten() if hasattr(indices, 'flatten') else indices
-                return boxes[indices], scores[indices], class_ids[indices]
+        # ---- 2) NMS ----
+        t_nms0 = time.perf_counter()
+        idxs = cv2.dnn.NMSBoxes(
+            boxes_xywh.tolist(),
+            scores.astype(np.float32).tolist(),
+            self.conf_threshold,
+            self.iou_threshold
+        )
+        t_nms1 = time.perf_counter()
 
-        return [], [], []
+        if len(idxs) == 0:
+            t_pp1 = time.perf_counter()
+            return (
+                np.empty((0, 4), np.float32),
+                np.empty((0,),  np.float32),
+                np.empty((0,),  np.int32),
+                {
+                    "parse": (t_parse1 - t_parse0),
+                    "nms": (t_nms1 - t_nms0),
+                    "postprocess": (t_pp1 - t_pp0),
+                }
+            )
+        
+        if isinstance(idxs, tuple):
+            idxs = idxs[0]
+        idxs = np.asarray(idxs).reshape(-1)
+
+        sel_boxes = boxes_xywh[idxs]
+        sel_scores = scores[idxs]
+        sel_ids = class_ids[idxs]
+
+        t_pp1 = time.perf_counter()
+        timing_pp = {
+            "parse": (t_parse1 - t_parse0),
+            "nms": (t_nms1 - t_nms0),
+            "postprocess": (t_pp1 - t_pp0),
+        }
+        return sel_boxes, sel_scores, sel_ids, timing_pp
 
     # --------------------- INFER ------------------------------
     def infer(self, image, debug=False):
         start_total = time.time()
 
-        # CPU: 전처리
+        # CPU: preprocess
         input_tensor, scale, pad_x, pad_y = self.preprocess(image)
 
         # GPU: HtoD -> TRT -> DtoH
@@ -272,8 +348,7 @@ class DetectorAndTracker:
                     self.context.execute_async_v3(stream_handle=self.stream.handle)
                 else:
                     self.context.execute_v2(bindings=self.bindings)
-            except Exception as e:
-                print(f"추론 실행 오류: {e}")
+            except Exception:
                 self.context.execute_v2(bindings=self.bindings)
 
             for o in self.outputs:
@@ -281,37 +356,20 @@ class DetectorAndTracker:
 
         inference_time = time.time() - start_inf
 
-        # CPU: 후처리
+        # CPU: postprocess (상세 타이밍 사용)
         out_data = [o['host'].reshape(o['shape']) for o in self.outputs]
-        boxes, scores, class_ids = self.postprocess(out_data, scale, pad_x, pad_y, debug)
+        boxes, scores, class_ids, pp_timing = self.postprocess(out_data, scale, pad_x, pad_y, debug)
 
         total_time = time.time() - start_total
         return boxes, scores, class_ids, {
-            'preprocess': total_time - inference_time,
+            'preprocess': total_time - inference_time - pp_timing['postprocess'],
             'inference': inference_time,
-            'postprocess': 0.0,  # 필요시 분리 계산 가능
+            'postprocess': pp_timing['postprocess'],
+            'nms': pp_timing['nms'],
+            'parse': pp_timing['parse'],
             'total': total_time
         }
 
-    # --------------------- MISC -------------------------------
-    def extract_crop_from_frame(self, frame: np.ndarray, bbox: list) -> str:
-        """Extract person crop and return base64 JPEG"""
-        try:
-            x, y, w, h = bbox
-            h_img, w_img = frame.shape[:2]
-            x = int(round(max(0, min(x, w_img - 1))))
-            y = int(round(max(0, min(y, h_img - 1))))
-            w = int(round(max(1, min(w_img - x, w))))
-            h = int(round(max(1, min(h_img - y, h))))
-            crop = frame[y:y + h, x:x + w]
-
-            crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
-            buffer = io.BytesIO()
-            crop_pil.save(buffer, format='JPEG')
-            return base64.b64encode(buffer.getvalue()).decode('utf-8')
-        except Exception as e:
-            print(f"Failed to extract crop: {e}")
-            return ""
     
     def _cpu_embedder_safe(self, chips):
         """
@@ -393,38 +451,53 @@ class DetectorAndTracker:
         tracks = self.tracker.update_tracks(detections, embeds=embeds, frame=frame)
 
         # 4) Confirmed 신규 track만 ReID 요청용 crop 생성
+        # TODO: first appearance time - end appearance time time stamp
         for track in tracks:
             if not track.is_confirmed():
                 continue
             tid = track.track_id
-            if tid in self.local_id_set:
+            if tid in self.local_id_set or tid in self.pending_reid:
                 continue
 
             l, t, r, b = track.to_ltrb()
             l = int(round(l)); t = int(round(t)); r = int(round(r)); b = int(round(b))
-            l = max(0, min(l, w_img - 1)); r = max(0, min(r, w_img))
-            t = max(0, min(t, h_img - 1)); b = max(0, min(b, h_img))
-            if r <= l or b <= t:
-                continue
-
-            crop = frame[t:b, l:r]
+            w = max(1, r - l); h = max(1, b - t)
+            crop = frame[max(t,0):max(b,0), max(l,0):max(r,0)]
             if crop.size == 0:
                 continue
 
-            # self.track_result_producer.send_message(crop)  # 필요시 전송
+            # Kafka 전송 (base64 JSON)
+            self.result_producer.send_message(
+                crop, track_id=tid, bbox=[l, t, w, h], class_name="person", encoding="base64"
+            )
+            self.pending_reid.add(tid)
             self.local_id_set.add(tid)
+            # 등장 시각 기록(세션 시작)
+            self.track_start_ts.setdefault(tid, int(time.time() * 1000))
         
+        curr_ids = {t.track_id for t in tracks if t.is_confirmed()}
+        ended = set(self.track_start_ts.keys()) - curr_ids
+        now_ms = int(time.time() * 1000)
+        for lid in list(ended):
+            gid = self.local_to_global.get(lid)
+            appeared = self.track_start_ts.get(lid)
+            if gid is not None and appeared is not None:
+                try:
+                    self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=now_ms)
+                except Exception as e:
+                    print(f"DB addNewDetection failed for local {lid} -> global {gid}: {e}")
+            # 상태 정리
+            self.track_start_ts.pop(lid, None)
+            self.local_to_global.pop(lid, None)
+            self.pending_reid.discard(lid)
+            self.local_id_set.discard(lid)
+
         # 5) return_vis = True인 경우 시각화 프레임 return 
         vis = None
         if return_vis:
             vis = self.draw_tracks(frame, tracks)
 
-        return (
-            vis, 
-            timing_info, 
-            boxes, scores, class_ids, 
-            tracks
-        )
+        return (vis, timing_info, boxes, scores, class_ids, tracks)
     
     def draw_tracks(self, image, tracks):
         vis = image.copy()

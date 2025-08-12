@@ -21,7 +21,8 @@ class ReIDService:
         load_dotenv('env/aws.env')
         self.broker = os.getenv('BROKER')
         self.request_topic = os.getenv('REID_REQUEST_TOPIC')
-        
+        self.response_topic = os.getenv('REID_RESPONSE_TOPIC')
+
         #DB
         self.db = db
 
@@ -101,67 +102,51 @@ class ReIDService:
             self.logger.error(f"Feature extraction failed: {e}")
             raise
     
-    def assign_global_id(self, feat_vec: np.ndarray, img) -> int:
-        """Assign global ID using FAISS similarity search"""
-        try:
-            # L2 normalize feature vector
-            faiss.normalize_L2(feat_vec)
-            
-            # Search for nearest neighbor
-            D, I = self.index.search(feat_vec, 1)
-            
-            if len(I[0]) > 0 and I[0][0] != -1:
-                sim = float(D[0][0])
-                if sim >= self.threshold:
-                    return int(I[0][0])
-            
-            # Create new global ID for new person
-            new_id = uuid.uuid4().int & ((1<<63)-1)
-            self.index.add_with_ids(feat_vec, np.array([new_id], dtype='int64'))
-            # TODO feature 저장 방법 고민
-            self.db.addNewDetectedObject(uuid=new_id, crop_img=img)
-            return new_id
-            
-        except Exception as e:
-            self.logger.error(f"Global ID assignment failed: {e}")
-            raise
+    def assign_global_id(self, feat_vec: np.ndarray, img_bytes: bytes) -> int:
+        faiss.normalize_L2(feat_vec)
+        D, I = self.index.search(feat_vec, 1)
+        if len(I[0]) > 0 and I[0][0] != -1 and float(D[0][0]) >= self.threshold:
+            return int(I[0][0])
+
+        new_id = uuid.uuid4().int & ((1<<63)-1)
+        self.index.add_with_ids(feat_vec, np.array([new_id], dtype='int64'))
+
+        # feature 직렬화(선택): base64 float32
+        feat_b64 = base64.b64encode(feat_vec.astype('float32').tobytes()).decode('utf-8')
+
+        # DB 저장: uuid, JPEG bytes, feature, code_name
+        self.db.addNewDetectedObject(uuid=new_id, crop_img=img_bytes, feature=feat_b64, code_name="사람")
+        
+        return new_id
     
     def process_reid_request(self, data: dict) -> dict:
-        """Process single ReID request"""
         camera_id = data.get('camera_id')
+        local_id  = data.get('local_id', data.get('track_id'))
         image_base64 = data.get('crop_jpg', '')
-        
-        try:
-            # Decode crop image
-            img_data = base64.b64decode(image_base64)
-            img = Image.open(io.BytesIO(img_data)).convert('RGB')
-        except Exception as e:
-            self.logger.error(f"Invalid crop image from cam={camera_id} : {e}")
-            raise
-        
-        # Extract feature and assign global ID
+        img_bytes = base64.b64decode(image_base64)
+        img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
+
         start = time.perf_counter()
         feature_vector = self.extract_feature(img)
-        global_id = self.assign_global_id(feature_vector, img)
+        global_id = self.assign_global_id(feature_vector, img_bytes)
         elapsed = time.perf_counter() - start
-        
-        # TODO addNewDetection 메소드 통해 db에 동선 저장, db.addNewDetection(self, uuid, appeared_time, exit_time)
 
-        # Prepare response
         response = {
             'camera_id': camera_id,
-            'global_id': global_id
+            'global_id': global_id,
+            'local_id':  local_id,   # ← 매칭을 위해 local_id 그대로 회신
         }
-
         self.logger.info(f"[ReID] cam={camera_id}  -> global={global_id} ({elapsed:.3f}s)")
+
         return response
     
+    # TODO: modifiy it storage to postgreDB
     def send_response(self, response: dict):
         """Send response back through Kafka"""
         try:
             self.producer.send(self.response_topic, response)
             self.producer.flush()
-        except Exception as e:
+        except Exception as e:  
             self.logger.error(f"Failed to send response: {e}")
             raise
     
