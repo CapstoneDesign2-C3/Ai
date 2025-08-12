@@ -5,6 +5,7 @@ class PostgreSQL:
         self.db = psycopg2.connect(
             host=host, dbname=dbname, user=user, password=password, port=port
         )
+        print(f'DB connnect success')
 
     def addNewDetectedObject(self, uuid, crop_img, feature="", code_name="사람"):
         with self.db.cursor() as cursor:
@@ -35,8 +36,23 @@ class PostgreSQL:
             detected_object_id = result[0]
 
             cursor.execute(
-                "INSERT INTO detection (detected_object_id, appeared_time, exit_time) VALUES (%s, %s, %s)",
+                """
+                INSERT INTO detection (detected_object_id, appeared_time, exit_time)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
                 (detected_object_id, appeared_time, exit_time)
+            )
+            det_id = cursor.fetchone()[0]
+            self.db.commit()
+            return det_id
+        
+    # 퇴장 시간 업데이트를 위한 메서드
+    def updateDetectionExitTime(self, detection_id, exit_time):
+        with self.db.cursor() as cursor:
+            cursor.execute(
+                "UPDATE detection SET exit_time = %s WHERE id = %s",
+                (exit_time, detection_id)
             )
             self.db.commit()
 

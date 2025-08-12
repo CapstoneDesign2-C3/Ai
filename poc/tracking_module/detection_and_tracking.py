@@ -16,14 +16,17 @@ from dotenv import load_dotenv
 from kafka_util import consumers, producers
 from deep_sort_realtime.deepsort_tracker import DeepSort
 from db_util.db_util import PostgreSQL
+from tracking_module.trackers import ByteTrackAdapter, OCSORTAdapter
 
 # (extract_crop_from_frame에서 사용)
 from PIL import Image
 import io, base64
 
 
+
 class DetectorAndTracker:
-    def __init__(self, class_names_path=None, conf_threshold=0.25, iou_threshold=0.45, cameraID=None):
+    def __init__(self, class_names_path=None, conf_threshold=0.25, iou_threshold=0.45, cameraID=None,
+                 tracker_type: str = "bytetrack"):
         """
         TensorRT YOLOv11 + DeepSORT (PyTorch) 통합
         - Torch가 만든 primary CUDA context를 PyCUDA/TensorRT가 공유
@@ -33,8 +36,8 @@ class DetectorAndTracker:
 
         # --- Kafka ---
         # self.frame_consumer = consumers.FrameConsumer(camera_id=cameraID)
-        self.result_producer = producers.create_track_result_producer(camera_id=cameraID)
         # self.track_result_producer = producers.TrackResultProducer(cameraID=cameraID)
+        self.result_producer = producers.create_track_result_producer(camera_id=cameraID)
 
         # --- 로컬 ID 세트 ---
         self.local_id_set = set()
@@ -70,22 +73,31 @@ class DetectorAndTracker:
             self.context = self.engine.create_execution_context()
             self.inputs, self.outputs, self.bindings, self.stream = self._allocate_buffers()
 
-        # --- DeepSORT ---
-        self.tracker = DeepSort(
-                                max_age=120,                 # 20frames ≈ 0.67s
-                                n_init=3,                   # 초기 확정 3프레임
-                                max_cosine_distance=0.25,   # appearance threshold
-                                nn_budget=80,               # appearance history 상한
-                                embedder_gpu=True,
-                                half=True,
-                                bgr=True,
-                                polygon=False,
-                                nms_max_overlap=1.0         # detector가 NMS 충분하면 1.0(=OFF)
-                            )
+        # --- Tracker 선택 --- #
+        self.tracker_type = tracker_type.lower().strip()
+        if self.tracker_type == "bytetrack":
+            # ByteTrack: 빠르고 ID 스위치 적음 (appearance 없이도 강함)
+            self.tracker = ByteTrackAdapter(
+                track_thresh=0.5,     # YOLO confidence 기준
+                track_buffer=60,      # 끊김 허용 프레임(상황 따라 30~90)
+                match_thresh=0.8
+            )
+        elif self.tracker_type == "ocsort":
+            # OC-SORT: 가림에 더 강함
+            self.tracker = OCSORTAdapter(
+                det_thresh=0.5,
+                iou_threshold=0.3,
+                max_age=30,
+                min_hits=3,
+                delta_t=3,
+                use_byte=False
+            )
+        else:
+            raise ValueError(f"Unsupported tracker_type: {tracker_type}")
 
         
         # 안전한 CPU 임베더(0벡터/NaN 방지)
-        self.embedder = self._cpu_embedder_safe
+        # self.embedder = self._cpu_embedder_safe
 
         self._print_engine_info()
 
@@ -397,33 +409,57 @@ class DetectorAndTracker:
                 embs.append(np.full(128, 1.0 / np.sqrt(128), np.float32))
         return np.vstack(embs) if embs else None
 
+    # 
+    def on_reid_response(self, data: dict):
+        lid = int(data.get("local_id", -1))
+        gid = int(data.get("global_id", -1))
+        det_id = int(data.get("detection_id", -1))
+        if lid >= 0 and det_id > 0 and gid > 0:
+            self.local_to_detection[lid] = det_id
+            self.local_to_global[lid] = gid
+            self.pending_reid.discard(lid)
+
+    
+    def _on_tracks_ended(self, ended_ids: set[int]):
+        now_ms = int(time.time() * 1000)
+        for lid in list(ended_ids):
+            det_id = self.local_to_detection.get(lid)
+            if det_id:
+                try:
+                    self.db.updateDetectionExitTime(det_id, now_ms)
+                except Exception as e:
+                    print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
+            # 상태 정리
+            self.local_to_detection.pop(lid, None)
+            self.local_to_global.pop(lid, None)
+            self.track_start_ts.pop(lid, None)
+            self.pending_reid.discard(lid)
+            self.local_id_set.discard(lid)
+
+            
+    # core
     def detect_and_track(self, frame, debug=False, return_vis=False):
         # 0) Inference
         boxes, scores, class_ids, timing_info = self.infer(frame, debug)
-       
-        if debug:
-            print(f"Inference timing: {timing_info}")
 
-        # 1) DeepSORT 입력으로 변환 (int + 경계 클램프)
+        # 1) YOLO → tracker detections (사람만)
         h_img, w_img = frame.shape[:2]
         detections = []
-        object_chips = []
-        for box, score, class_id in zip(boxes, scores, class_ids):
-            if int(class_id) != 0: # 사람만 필터링
+        for box, score, cid in zip(boxes, scores, class_ids):
+            if int(cid) != 0:
                 continue
             x1, y1, w, h = box
-            x1 = int(round(x1)); y1 = int(round(y1))
-            w = int(round(w)); h = int(round(h))
-            x1 = max(0, min(x1, w_img - 1))
-            y1 = max(0, min(y1, h_img - 1))
-            w = max(1, min(w_img - x1, w))
-            h = max(1, min(h_img - y1, h))
+            # 정수화 + 경계클램프
+            x1 = max(0, min(int(round(x1)), w_img - 1))
+            y1 = max(0, min(int(round(y1)), h_img - 1))
+            w  = max(1, min(int(round(w)),  w_img - x1))
+            h  = max(1, min(int(round(h)),  h_img - y1))
+            detections.append(([x1, y1, w, h], float(score), int(cid)))
 
-            detections.append(([x1, y1, w, h], float(score), int(class_id)))
-            chip = frame[y1:y1 + h, x1:x1 + w]
-            if chip.size > 0:
-                object_chips.append(chip)
+        # 2) Update tracks (ByteTrack/OC-SORT는 embeds 안 씀)
+        tracks = self.tracker.update_tracks(detections, frame=frame)
 
+        '''  
         # 2) 임베딩
         # 임베딩 (없으면 None)
         embeds = self.embedder(object_chips) if object_chips else None
@@ -445,12 +481,13 @@ class DetectorAndTracker:
         
         if embeds is not None and len(embeds) != len(detections):
                 embeds = None
-
+        
 
         # 3) Track 업데이트
         tracks = self.tracker.update_tracks(detections, embeds=embeds, frame=frame)
+        '''
 
-        # 4) Confirmed 신규 track만 ReID 요청용 crop 생성
+        #  Confirmed 신규 track만 ReID 요청용 crop 생성
         # TODO: first appearance time - end appearance time time stamp
         for track in tracks:
             if not track.is_confirmed():
@@ -470,6 +507,9 @@ class DetectorAndTracker:
             self.result_producer.send_message(
                 crop, track_id=tid, bbox=[l, t, w, h], class_name="person", encoding="base64"
             )
+            
+            print(f'{tid} is sent') # for debugging
+    
             self.pending_reid.add(tid)
             self.local_id_set.add(tid)
             # 등장 시각 기록(세션 시작)
@@ -493,11 +533,12 @@ class DetectorAndTracker:
             self.local_id_set.discard(lid)
 
         # 5) return_vis = True인 경우 시각화 프레임 return 
-        vis = None
         if return_vis:
             vis = self.draw_tracks(frame, tracks)
+        else:
+            vis = None
+        return vis, timing_info, boxes, scores, class_ids, tracks
 
-        return (vis, timing_info, boxes, scores, class_ids, tracks)
     
     def draw_tracks(self, image, tracks):
         vis = image.copy()

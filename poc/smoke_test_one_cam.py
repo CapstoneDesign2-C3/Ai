@@ -51,7 +51,7 @@ def main():
     win = "RTSP Preview (press q to quit)"
     cv2.namedWindow(win, cv2.WINDOW_NORMAL)
 
-    detector = DetectorAndTracker(cameraID=camera_id)
+    detector = DetectorAndTracker(cameraID=camera_id, tracker_type='ocsort')
 
     # FPS 측정
     last_t = time.time()
