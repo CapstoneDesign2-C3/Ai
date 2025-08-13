@@ -55,6 +55,15 @@ class ReIDService:
         self.logger.info(f"ReID service initialized on device: {self.device}")
         self.logger.info(f"Listening on '{self.request_topic}', publishing to '{self.response_topic}'")
 
+    # ----------------------- Image Util -----------------------
+    def _pil_to_jpeg_bytes(self, img, quality=90) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+
+        return buf.getvalue()
+
+
+
     # ----------------------- Init -----------------------
     def _init_faiss_index(self):
         """FAISS index (IP + IDMap). GPU 가능 시 GPU index 사용."""
@@ -87,7 +96,7 @@ class ReIDService:
             self.request_topic,
             bootstrap_servers=[self.broker],
             value_deserializer=lambda b: json.loads(b.decode('utf-8')),
-            auto_offset_reset='latest',
+            auto_offset_reset='earliest',
             enable_auto_commit=True,
             group_id='reid-global-service'
         )
@@ -118,33 +127,33 @@ class ReIDService:
             self.logger.error(f"Feature extraction failed: {e}")
             raise
 
-    def assign_global_id(self, feat_vec: np.ndarray, img_bytes: bytes, code_name: str = "사람") -> tuple[int, bool]:
+    def assign_global_id(self, feat_vec: np.ndarray, img_pil: Image.Image, code_name: str = "사람") -> tuple[int, bool]:
         """
-        FAISS로 최근접 검색 후 임계치 미만이면 신규 global_id 생성.
-        신규일 때 detected_object 테이블에 썸네일/feature 저장.
+        FAISS로 최근접 검색 → 임계치 미만이면 신규 global_id 생성.
+        신규일 때만 detected_object 테이블에 썸네일/feature 저장.
+        반환: (global_id, is_exist)
         """
         try:
             faiss.normalize_L2(feat_vec)
-            D, I = self.index.search(feat_vec, 1)   # D: similarity or distance | I: index of similarity 
+            D, I = self.index.search(feat_vec, 1)
 
-            if len(I[0]) > 0 and I[0][0] != -1: # search result is valid
+            if len(I[0]) > 0 and I[0][0] != -1:
                 sim = float(D[0][0])
-
-                # already exist object.
                 if sim >= self.threshold:
-                    # TODO: add crop image to detection / need index -> uuid method
-                    self.db.addNewDetection()
                     return int(I[0][0]), True
 
             # 신규 등록
             new_id = uuid.uuid4().int & ((1 << 63) - 1)
             self.index.add_with_ids(feat_vec, np.array([new_id], dtype='int64'))
 
-            # feature 직렬화(base64 of float32 bytes)
-            feat_b64 = base64.b64encode(feat_vec.astype('float32').tobytes()).decode('utf-8')
+            try:
+                jpeg = self._pil_to_jpeg_bytes(img_pil)
+                feat_b64 = base64.b64encode(feat_vec.astype('float32').tobytes()).decode('utf-8')
+                # 🔹 전역 객체 카탈로그(썸네일/feature)는 여기서 1회만 저장
+                self.db.addNewDetectedObject(uuid=new_id, crop_img=jpeg, feature=feat_b64, code_name=code_name)
+            except Exception as e:
+                self.logger.error(f"addNewDetectedObject failed: {e}")
 
-            # DB 저장 (BYTEA에 JPEG bytes)
-            self.db.addNewDetectedObject(uuid=new_id, crop_img=img_bytes, feature=feat_b64, code_name=code_name)
             return new_id, False
 
         except Exception as e:
@@ -156,7 +165,7 @@ class ReIDService:
         camera_id = data.get('camera_id')
         local_id  = data.get('local_id') or data.get('track_id')
         image_base64 = data.get('crop_jpg', '')
-        class_name = data.get('class_name', 'person')  # 한글 '사람' 코드와 매핑 목적
+        class_name = data.get('class_name', 'person')
 
         # crop decode
         try:
@@ -169,30 +178,19 @@ class ReIDService:
         # feature & id 결정
         start = time.perf_counter()
         feature_vector = self.extract_feature(img)
-
         code_name = "사람" if class_name.lower() == "person" else class_name
-        global_id, is_exist = self.assign_global_id(feature_vector, img_bytes, code_name=code_name)
+        global_id, is_exist = self.assign_global_id(feature_vector, img, code_name=code_name)
         elapsed = time.perf_counter() - start
 
-        now_ms = int(time.time() * 1000)
-        detection_id = self.db.addNewDetection(
-            uuid=global_id,
-            appeared_time=now_ms,
-            exit_time=now_ms        # 임시값, tracker에서 퇴장시 update
-        )
-
-
-        # 응답(로컬 매칭 위해 local_id 포함)
+        # 🔹 detection row는 tracker가 넣는다 (여기서 넣지 않음)
         response = {
-        "camera_id": camera_id,
-        "local_id": local_id,
-        "global_id": global_id,
-        "detection_id": detection_id,   # ← tracker가 보관
-        "appeared_time": now_ms,        # ← 필요 시 자연키 대체
-        "existing": bool(is_exist),
-        "status": "success"
+            "camera_id": camera_id,
+            "local_id": local_id,
+            "global_id": global_id,
+            "existing": bool(is_exist),
+            "status": "success",
+            "elapsed_ms": round(elapsed * 1000, 2),
         }
-
         self.logger.info(f"[ReID] cam={camera_id} local={local_id} -> global={global_id} ({elapsed*1000:.1f} ms)")
         return response
 

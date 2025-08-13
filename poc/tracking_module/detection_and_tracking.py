@@ -44,6 +44,7 @@ class DetectorAndTracker:
         self.pending_reid = set()        # 전송했지만 응답 대기
         self.local_to_global = {}        # local_id -> global_id
         self.track_start_ts = {}         # local_id -> appeared_time(ms)
+        self.local_to_detection = {}
 
         self.db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'),
                              os.getenv('DB_USER'), os.getenv('DB_PASSWORD'), os.getenv('DB_PORT'))
@@ -160,12 +161,28 @@ class DetectorAndTracker:
             raise
 
     def on_reid_response(self, data: dict):
-        """REID_RESPONSE_TOPIC 수신 핸들러"""
-        gid = int(data.get("global_id", -1))
+        """REID_RESPONSE_TOPIC 수신 핸들러: gid 매핑 및 DB insert(appeared)"""
         lid = int(data.get("local_id", data.get("track_id", -1)))
-        if gid > 0 and lid >= 0:
-            self.local_to_global[lid] = gid
-            self.pending_reid.discard(lid)
+        gid = int(data.get("global_id", -1))
+        if gid <= 0 or lid < 0:
+            return
+
+        # gid 매핑
+        self.local_to_global[lid] = gid
+        self.pending_reid.discard(lid)
+
+        # 이미 detection_id가 있으면(중복 응답/재전송) 스킵
+        if lid in self.local_to_detection and self.local_to_detection[lid]:
+            return
+
+        # appeared_time 기준 확정   
+        appeared = self.track_start_ts.get(lid, int(time.time() * 1000))
+        try:
+            # 🔹 응답 시점에 insert (tracker가 책임)
+            det_id = self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=appeared)
+            self.local_to_detection[lid] = det_id
+        except Exception as e:
+            print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
 
     def _allocate_buffers(self):
         inputs, outputs, bindings = [], [], []
@@ -504,6 +521,7 @@ class DetectorAndTracker:
                 continue
 
             # Kafka 전송 (base64 JSON)
+            # tracker 처음 들어왔을 때만 보내는 위치로
             self.result_producer.send_message(
                 crop, track_id=tid, bbox=[l, t, w, h], class_name="person", encoding="base64"
             )
@@ -519,18 +537,19 @@ class DetectorAndTracker:
         ended = set(self.track_start_ts.keys()) - curr_ids
         now_ms = int(time.time() * 1000)
         for lid in list(ended):
-            gid = self.local_to_global.get(lid)
-            appeared = self.track_start_ts.get(lid)
-            if gid is not None and appeared is not None:
+            det_id = self.local_to_detection.get(lid)
+            if det_id:
                 try:
-                    self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=now_ms)
+                    # 🔹 종료 시엔 exit 시간만 업데이트
+                    self.db.updateDetectionExitTime(det_id, now_ms)
                 except Exception as e:
-                    print(f"DB addNewDetection failed for local {lid} -> global {gid}: {e}")
+                    print(f"DB updateDetectionExitTime failed: det_id={det_id}, err={e}")
             # 상태 정리
             self.track_start_ts.pop(lid, None)
             self.local_to_global.pop(lid, None)
             self.pending_reid.discard(lid)
             self.local_id_set.discard(lid)
+            self.local_to_detection.pop(lid, None)
 
         # 5) return_vis = True인 경우 시각화 프레임 return 
         if return_vis:
