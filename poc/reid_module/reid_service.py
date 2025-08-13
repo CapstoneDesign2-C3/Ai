@@ -55,13 +55,9 @@ class ReIDService:
         self.logger.info(f"ReID service initialized on device: {self.device}")
         self.logger.info(f"Listening on '{self.request_topic}', publishing to '{self.response_topic}'")
 
-    # ----------------------- Image Util -----------------------
-    def _pil_to_jpeg_bytes(self, img, quality=90) -> bytes:
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality)
-
-        return buf.getvalue()
-
+        # --- Cache / Idempotency key ---
+        self.idemp_ttl_ms = int(os.getenv('REID_IDEMP_TTL_MS', '30000'))  # 30s 기본
+        self._idemp_cache = {}  # key -> (gid, ts_ms)
 
 
     # ----------------------- Init -----------------------
@@ -114,6 +110,31 @@ class ReIDService:
                                  std=[0.229, 0.224, 0.225])
         ])
 
+    # ----------------------- Idempotency Key ------------
+    def _idemp_get(self, key: str):
+        now = int(time.time() * 1000)
+        v = self._idemp_cache.get(key)
+        if not v: return None
+        gid, ts = v
+        if now - ts > self.idemp_ttl_ms:
+            self._idemp_cache.pop(key, None)
+            return None
+        
+        return gid
+    
+    def _idemp_put(self, key: str, gid: int):
+        self._idemp_cache[key] = (gid, int(time.time() * 1000))
+    
+
+    # ----------------------- Image Util -----------------------
+    def _pil_to_jpeg_bytes(self, img: Image.Image, quality=90) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+
+        return buf.getvalue()
+
+
+
     # ----------------------- Core -----------------------
     def extract_feature(self, img: Image.Image) -> np.ndarray:
         """PIL.Image -> 1x512 float32 (L2 normalized)."""
@@ -127,6 +148,7 @@ class ReIDService:
             self.logger.error(f"Feature extraction failed: {e}")
             raise
 
+    
     def assign_global_id(self, feat_vec: np.ndarray, img_pil: Image.Image, code_name: str = "사람") -> tuple[int, bool]:
         """
         FAISS로 최근접 검색 → 임계치 미만이면 신규 global_id 생성.
@@ -149,7 +171,6 @@ class ReIDService:
             try:
                 jpeg = self._pil_to_jpeg_bytes(img_pil)
                 feat_b64 = base64.b64encode(feat_vec.astype('float32').tobytes()).decode('utf-8')
-                # 🔹 전역 객체 카탈로그(썸네일/feature)는 여기서 1회만 저장
                 self.db.addNewDetectedObject(uuid=new_id, crop_img=jpeg, feature=feat_b64, code_name=code_name)
             except Exception as e:
                 self.logger.error(f"addNewDetectedObject failed: {e}")
@@ -160,12 +181,27 @@ class ReIDService:
             self.logger.error(f"Global ID assignment failed: {e}")
             raise
 
+    
     def process_reid_request(self, data: dict) -> dict:
         """Kafka 메시지 1건 처리 → global_id 결정 → 응답 payload 생성."""
         camera_id = data.get('camera_id')
         local_id  = data.get('local_id') or data.get('track_id')
         image_base64 = data.get('crop_jpg', '')
         class_name = data.get('class_name', 'person')
+
+        # idempotency key (생산자에서 보낸 값이 있으면 우선) + cache
+        idemp = data.get('idempotency_key') or f"{camera_id}:{local_id}"
+        cached_gid = self._idemp_get(idemp)
+        if cached_gid:
+            # 같은 local_id 재처리: 검색/추가 생략하고 바로 재응답
+            return {
+                "camera_id": camera_id,
+                "local_id": local_id,
+                "global_id": int(cached_gid),
+                "existing": True,
+                "status": "success",
+                "elapsed_ms": 0.0
+            }
 
         # crop decode
         try:
@@ -180,19 +216,24 @@ class ReIDService:
         feature_vector = self.extract_feature(img)
         code_name = "사람" if class_name.lower() == "person" else class_name
         global_id, is_exist = self.assign_global_id(feature_vector, img, code_name=code_name)
-        elapsed = time.perf_counter() - start
+        elapsed = (time.perf_counter() - start) * 1000.0
 
-        # 🔹 detection row는 tracker가 넣는다 (여기서 넣지 않음)
+        # idempotency cache 저장
+        self._idemp_put(idemp, global_id)
+
+        # detection INSERT는 이제 tracker가 응답 수신 시 수행 (여기서는 제거)
         response = {
             "camera_id": camera_id,
             "local_id": local_id,
-            "global_id": global_id,
+            "global_id": int(global_id),
             "existing": bool(is_exist),
             "status": "success",
-            "elapsed_ms": round(elapsed * 1000, 2),
+            "elapsed_ms": round(elapsed, 2)
         }
-        self.logger.info(f"[ReID] cam={camera_id} local={local_id} -> global={global_id} ({elapsed*1000:.1f} ms)")
+        self.logger.info(f"[ReID] cam={camera_id} local={local_id} -> global={global_id} ({elapsed:.1f} ms)")
+
         return response
+
 
     def send_response(self, response: dict):
         """Kafka 응답 publish."""

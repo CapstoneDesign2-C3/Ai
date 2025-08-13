@@ -256,6 +256,7 @@ class TrackResultProducer(BaseProducer):
         confidence: Optional[float] = None,
         class_name: Optional[str] = None,
         encoding: str = "base64",
+        idempotency_key: Optional[str] = None
     ) -> Dict[str, Any]:
         """
         encoding='base64' 권장(서비스 포맷 부합). 'binary'도 지원.

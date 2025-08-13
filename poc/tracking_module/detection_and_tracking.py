@@ -40,6 +40,7 @@ class DetectorAndTracker:
         self.result_producer = producers.create_track_result_producer(camera_id=cameraID)
 
         # --- 로컬 ID 세트 ---
+        self.camera_id = cameraID
         self.local_id_set = set()
         self.pending_reid = set()        # 전송했지만 응답 대기
         self.local_to_global = {}        # local_id -> global_id
@@ -88,7 +89,7 @@ class DetectorAndTracker:
             self.tracker = OCSORTAdapter(
                 det_thresh=0.5,
                 iou_threshold=0.3,
-                max_age=30,
+                max_age=120,
                 min_hits=3,
                 delta_t=3,
                 use_byte=False
@@ -101,6 +102,7 @@ class DetectorAndTracker:
         # self.embedder = self._cpu_embedder_safe
 
         self._print_engine_info()
+
 
     # --------------------- UTIL: CUDA ctx ---------------------
     @contextmanager
@@ -121,6 +123,7 @@ class DetectorAndTracker:
             self.cuda_ctx.detach()
         except Exception:
             pass
+
 
     # --------------------- ENGINE/IO --------------------------
     def _load_class_names(self, class_names_path):
@@ -159,30 +162,6 @@ class DetectorAndTracker:
         except Exception as e:
             print(f"❌ 엔진 로드 실패: {e}")
             raise
-
-    def on_reid_response(self, data: dict):
-        """REID_RESPONSE_TOPIC 수신 핸들러: gid 매핑 및 DB insert(appeared)"""
-        lid = int(data.get("local_id", data.get("track_id", -1)))
-        gid = int(data.get("global_id", -1))
-        if gid <= 0 or lid < 0:
-            return
-
-        # gid 매핑
-        self.local_to_global[lid] = gid
-        self.pending_reid.discard(lid)
-
-        # 이미 detection_id가 있으면(중복 응답/재전송) 스킵
-        if lid in self.local_to_detection and self.local_to_detection[lid]:
-            return
-
-        # appeared_time 기준 확정   
-        appeared = self.track_start_ts.get(lid, int(time.time() * 1000))
-        try:
-            # 🔹 응답 시점에 insert (tracker가 책임)
-            det_id = self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=appeared)
-            self.local_to_detection[lid] = det_id
-        except Exception as e:
-            print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
 
     def _allocate_buffers(self):
         inputs, outputs, bindings = [], [], []
@@ -242,6 +221,75 @@ class DetectorAndTracker:
                 methods.append(m)
         print(f"   - 사용 가능한 실행 메서드: {', '.join(methods)}")
 
+# --------------------- embedding --------------------------
+    def _cpu_embedder_safe(self, chips):
+        """
+        HSV 히스토그램 기반 128-d 임베딩 (CPU)
+        - 각 chip 당 (H:48 + S:32 + V:48) = 128 차원
+        - L2 정규화 시 ε로 0분모 방지
+        """
+        embs = []
+        for chip in chips:
+            try:
+                hsv = cv2.cvtColor(chip, cv2.COLOR_BGR2HSV)
+                h_hist = cv2.calcHist([hsv], [0], None, [48], [0, 180]).flatten()
+                s_hist = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
+                v_hist = cv2.calcHist([hsv], [2], None, [48], [0, 256]).flatten()
+                vec = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)  # (128,)
+                norm = np.linalg.norm(vec)
+                if not np.isfinite(norm) or norm == 0.0:
+                    # 완전 평면/검은 이미지 등 → 안전한 기본값
+                    vec[:] = 1.0 / np.sqrt(128)
+                else:
+                    vec /= norm
+                embs.append(vec)
+            except Exception:
+                # 변환 실패 시에도 안전한 기본값
+                embs.append(np.full(128, 1.0 / np.sqrt(128), np.float32))
+
+        return np.vstack(embs) if embs else None
+
+# --------------------- track/reid util --------------------------
+    def _on_tracks_ended(self, ended_ids: set[int]):
+        now_ms = int(time.time() * 1000)
+        for lid in list(ended_ids):
+            det_id = self.local_to_detection.get(lid)
+            if det_id:
+                try:
+                    self.db.updateDetectionExitTime(det_id, now_ms)
+                except Exception as e:
+                    print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
+            # 상태 정리
+            self.local_to_detection.pop(lid, None)
+            self.local_to_global.pop(lid, None)
+            self.track_start_ts.pop(lid, None)
+            self.pending_reid.discard(lid)
+            self.local_id_set.discard(lid)
+
+
+    def on_reid_response(self, data: dict):
+        """REID_RESPONSE_TOPIC 수신 핸들러:
+        gid 매핑 + (없을 때) appeared 시점으로 addNewDetection 수행"""
+        lid = int(data.get("local_id", data.get("track_id", -1)))
+        gid = int(data.get("global_id", -1))
+        if gid <= 0 or lid < 0:
+            return
+
+        # 매핑/대기 해제
+        self.local_to_global[lid] = gid
+        self.pending_reid.discard(lid)
+
+        # 이미 detection_id 보유(중복 응답)면 스킵
+        if self.local_to_detection.get(lid):
+            return
+
+        appeared = self.track_start_ts.get(lid, int(time.time() * 1000))
+        try:
+            det_id = self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=appeared)
+            self.local_to_detection[lid] = det_id
+        except Exception as e:
+            print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
+
     # --------------------- PRE/POST ---------------------------
     def preprocess(self, image):
         # 입력 shape: (N,C,H,W)
@@ -262,7 +310,6 @@ class DetectorAndTracker:
         input_tensor = np.expand_dims(input_tensor, axis=0)
         return input_tensor, scale, pad_x, pad_y
 
-    # detection_and_tracking.py
 
     def postprocess(self, outputs, scale, pad_x, pad_y, debug=False):
         t_pp0 = time.perf_counter()
@@ -400,58 +447,7 @@ class DetectorAndTracker:
         }
 
     
-    def _cpu_embedder_safe(self, chips):
-        """
-        HSV 히스토그램 기반 128-d 임베딩 (CPU)
-        - 각 chip 당 (H:48 + S:32 + V:48) = 128 차원
-        - L2 정규화 시 ε로 0분모 방지
-        """
-        embs = []
-        for chip in chips:
-            try:
-                hsv = cv2.cvtColor(chip, cv2.COLOR_BGR2HSV)
-                h_hist = cv2.calcHist([hsv], [0], None, [48], [0, 180]).flatten()
-                s_hist = cv2.calcHist([hsv], [1], None, [32], [0, 256]).flatten()
-                v_hist = cv2.calcHist([hsv], [2], None, [48], [0, 256]).flatten()
-                vec = np.concatenate([h_hist, s_hist, v_hist]).astype(np.float32)  # (128,)
-                norm = np.linalg.norm(vec)
-                if not np.isfinite(norm) or norm == 0.0:
-                    # 완전 평면/검은 이미지 등 → 안전한 기본값
-                    vec[:] = 1.0 / np.sqrt(128)
-                else:
-                    vec /= norm
-                embs.append(vec)
-            except Exception:
-                # 변환 실패 시에도 안전한 기본값
-                embs.append(np.full(128, 1.0 / np.sqrt(128), np.float32))
-        return np.vstack(embs) if embs else None
-
-    # 
-    def on_reid_response(self, data: dict):
-        lid = int(data.get("local_id", -1))
-        gid = int(data.get("global_id", -1))
-        det_id = int(data.get("detection_id", -1))
-        if lid >= 0 and det_id > 0 and gid > 0:
-            self.local_to_detection[lid] = det_id
-            self.local_to_global[lid] = gid
-            self.pending_reid.discard(lid)
-
-    
-    def _on_tracks_ended(self, ended_ids: set[int]):
-        now_ms = int(time.time() * 1000)
-        for lid in list(ended_ids):
-            det_id = self.local_to_detection.get(lid)
-            if det_id:
-                try:
-                    self.db.updateDetectionExitTime(det_id, now_ms)
-                except Exception as e:
-                    print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
-            # 상태 정리
-            self.local_to_detection.pop(lid, None)
-            self.local_to_global.pop(lid, None)
-            self.track_start_ts.pop(lid, None)
-            self.pending_reid.discard(lid)
-            self.local_id_set.discard(lid)
+  
 
             
     # core
@@ -522,9 +518,16 @@ class DetectorAndTracker:
 
             # Kafka 전송 (base64 JSON)
             # tracker 처음 들어왔을 때만 보내는 위치로
+            idemp = f"{self.camera_id}:{tid}"
             self.result_producer.send_message(
-                crop, track_id=tid, bbox=[l, t, w, h], class_name="person", encoding="base64"
+                crop,
+                track_id=tid,
+                bbox=[l, t, w, h],
+                class_name="person",
+                encoding="base64",
+                idempotency_key=idemp
             )
+
             
             print(f'{tid} is sent') # for debugging
     
@@ -540,16 +543,15 @@ class DetectorAndTracker:
             det_id = self.local_to_detection.get(lid)
             if det_id:
                 try:
-                    # 🔹 종료 시엔 exit 시간만 업데이트
                     self.db.updateDetectionExitTime(det_id, now_ms)
                 except Exception as e:
                     print(f"DB updateDetectionExitTime failed: det_id={det_id}, err={e}")
             # 상태 정리
             self.track_start_ts.pop(lid, None)
+            self.local_to_detection.pop(lid, None)
             self.local_to_global.pop(lid, None)
             self.pending_reid.discard(lid)
             self.local_id_set.discard(lid)
-            self.local_to_detection.pop(lid, None)
 
         # 5) return_vis = True인 경우 시각화 프레임 return 
         if return_vis:
