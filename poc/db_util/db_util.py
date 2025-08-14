@@ -29,6 +29,7 @@ class PostgreSQL:
                 (uuid, psycopg2.Binary(crop_img), feature, code_id)
             )
         self.db.commit()
+        print(f'uuid : {uuid} is insert')   # for debugging
 
 
     def addNewDetection(self, uuid, appeared_time, exit_time=None):
@@ -50,16 +51,17 @@ class PostgreSQL:
                     raise ValueError(f"uuid({uuid})가 detected_object에 없습니다.")
                 detected_object_id = row[0]
 
+                utc_appeared_time = datetime.utcfromtimestamp(appeared_time / 1000.0)
                 cursor.execute(
                     """
                     INSERT INTO detection (detected_object_id, appeared_time, exit_time)
                     VALUES (%s, %s, %s)
                     RETURNING id
                     """,
-                    (detected_object_id, appeared_time, exit_time)
+                    (detected_object_id, utc_appeared_time, exit_time)
                 )
                 det_id = cursor.fetchone()[0]
-
+                print(f'uuid : {uuid} is updated: add new detection')   # for debugging
                 cursor.execute("COMMIT;")
                 return det_id
         except Exception:
@@ -73,7 +75,7 @@ class PostgreSQL:
         exit_time: epoch ms(int) 또는 datetime
         """
         if isinstance(exit_time, (int, float)):
-            exit_dt = datetime.fromtimestamp(exit_time / 1000.0)
+            exit_dt = datetime.utcfromtimestamp(exit_time / 1000.0)
         elif isinstance(exit_time, datetime):
             exit_dt = exit_time
         else:
@@ -81,12 +83,11 @@ class PostgreSQL:
 
         with self.db.cursor() as cursor:
             cursor.execute(
-                "UPDATE detection SET exit_time = GREATEST(exit_time, %s) WHERE id = %s;",
+                "UPDATE detection SET exit_time = GREATEST(COALESCE(exit_time, %s), %s) WHERE id = %s;",
                 (exit_dt, detection_id)
             )
         self.db.commit()
-
-
+        print(f'updateDetectionExitTime : det id = {detection_id}')   # for debugging
     
     def getCameraInfo(self):
         with self.db.cursor() as cursor:
