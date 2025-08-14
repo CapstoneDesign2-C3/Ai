@@ -250,11 +250,12 @@ class ReIDService:
     def send_response(self, response: dict):
         """Kafka 응답 publish."""
         try:
-            self.producer.send(self.response_topic, response)
+            cam = response.get("camera_id")
+            key_bytes = str(cam).encode("utf-8") if cam is not None else None
+            self.producer.send(self.response_topic, key=key_bytes, value=response)
             self.producer.flush()
         except Exception as e:
             self.logger.error(f"Failed to send response: {e}")
-            raise
 
     # ----------------------- Loop -----------------------
     def run(self):
