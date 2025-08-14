@@ -4,13 +4,14 @@ import json
 import atexit
 from contextlib import contextmanager
 from pathlib import Path
-
-import threading    
+  
 import numpy as np
 import cv2
 import tensorrt as trt
 import pycuda.driver as cuda
 import torch
+import threading
+import io, base64
 
 from dotenv import load_dotenv
 from kafka_util import consumers, producers
@@ -18,10 +19,8 @@ from deep_sort_realtime.deepsort_tracker import DeepSort
 from db_util.db_util import PostgreSQL
 from tracking_module.trackers import ByteTrackAdapter, OCSORTAdapter
 
-# (extract_crop_from_frame에서 사용)
 from PIL import Image
-import io, base64
-
+from datetime import datetime
 
 
 class DetectorAndTracker:
@@ -42,10 +41,13 @@ class DetectorAndTracker:
         # --- 로컬 ID 세트 ---
         self.camera_id = cameraID
         self.local_id_set = set()
-        self.pending_reid = set()        # 전송했지만 응답 대기
-        self.local_to_global = {}        # local_id -> global_id
-        self.track_start_ts = {}         # local_id -> appeared_time(ms)
-        self.local_to_detection = {}
+        self.pending_reid = set()               # 전송했지만 응답 대기
+        self.local_to_global = {}               # local_id -> global_id
+        self.track_start_ts = {}                # local_id -> appeared_time(ms)
+        self.local_to_detection = {}        
+        self.track_lifecycle = {}               # local id lifecycle 관리,  lid -> {"start_ms": int, "status": str, "gid": int}
+        self._state_lock = threading.Lock()     # 멀티 스레드 환경에서 race condition 관리
+
 
         self.db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'),
                              os.getenv('DB_USER'), os.getenv('DB_PASSWORD'), os.getenv('DB_PORT'))
@@ -250,45 +252,78 @@ class DetectorAndTracker:
         return np.vstack(embs) if embs else None
 
 # --------------------- track/reid util --------------------------
-    def _on_tracks_ended(self, ended_ids: set[int]):
-        now_ms = int(time.time() * 1000)
-        for lid in list(ended_ids):
-            det_id = self.local_to_detection.get(lid)
-            if det_id:
-                try:
-                    self.db.updateDetectionExitTime(det_id, now_ms)
-                except Exception as e:
-                    print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
-            # 상태 정리
-            self.local_to_detection.pop(lid, None)
-            self.local_to_global.pop(lid, None)
-            self.track_start_ts.pop(lid, None)
-            self.pending_reid.discard(lid)
-            self.local_id_set.discard(lid)
-
-
     def on_reid_response(self, data: dict):
-        """REID_RESPONSE_TOPIC 수신 핸들러:
-        gid 매핑 + (없을 때) appeared 시점으로 addNewDetection 수행"""
         lid = int(data.get("local_id", data.get("track_id", -1)))
         gid = int(data.get("global_id", -1))
         if gid <= 0 or lid < 0:
             return
 
-        # 매핑/대기 해제
-        self.local_to_global[lid] = gid
-        self.pending_reid.discard(lid)
+        with self._state_lock:
+            # 매핑/대기 해제
+            self.local_to_global[lid] = gid
+            self.pending_reid.discard(lid)
 
-        # 이미 detection_id 보유(중복 응답)면 스킵
-        if self.local_to_detection.get(lid):
-            return
+            # 이미 detection_id 있으면(중복 응답) 스킵
+            if self.local_to_detection.get(lid):
+                return
 
-        appeared = self.track_start_ts.get(lid, int(time.time() * 1000))
+            # start_ms가 정리되어도 안전하게 기본값 now_ms 사용
+            appeared_ms = self.track_start_ts.get(lid, int(time.time() * 1000))
+            appeared_dt = datetime.utcfromtimestamp(appeared_ms / 1000.0)
+
+        # DB Insert: exit_time=None
         try:
-            det_id = self.db.addNewDetection(uuid=gid, appeared_time=appeared, exit_time=appeared)
-            self.local_to_detection[lid] = det_id
+            det_id = self.db.addNewDetection(
+                uuid=str(gid),
+                appeared_time=appeared_dt,
+                exit_time=None  # ⭐ 중요 변경: NULL 저장
+            )
+            with self._state_lock:
+                self.local_to_detection[lid] = det_id
+                status = self.track_lifecycle.get(lid, {}).get("status")
+            if status == "end_scheduled":
+                self._finalize_track(lid)
         except Exception as e:
             print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
+            # TODO: 실패시 어떻게 처리할지.
+
+    def _finalize_track(self, lid: int, *, exit_ms: int | None = None):
+        """
+        트랙 종료 처리: 
+        - ReID 대기중이면 'end_scheduled'만 표시
+        - detection_id가 있으면 exit_time 업데이트
+        - 상태 정리는 여기서 일괄 처리
+        """
+        now_ms = int(time.time() * 1000) if exit_ms is None else exit_ms
+
+        with self._state_lock:
+            # 종료 예약: 아직 detection_id가 없으면 (ReID 응답 대기)
+            if lid not in self.local_to_detection:
+                # pending 중이면 예약만
+                if lid in self.pending_reid:
+                    # 예약 표시만 해두고 반환
+                    self.track_lifecycle.setdefault(lid, {})
+                    self.track_lifecycle[lid]["status"] = "end_scheduled"
+                    return
+
+            det_id = self.local_to_detection.get(lid)
+
+        if det_id:
+            try:
+                self.db.updateDetectionExitTime(det_id, now_ms)
+            except Exception as e:
+                print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
+
+        # 상태 정리
+        with self._state_lock:
+            self.local_to_detection.pop(lid, None)
+            self.local_to_global.pop(lid, None)
+            self.track_start_ts.pop(lid, None)
+            self.pending_reid.discard(lid)
+            self.local_id_set.discard(lid)
+            # lifecycle 끝
+            self.track_lifecycle.pop(lid, None)
+
 
     # --------------------- PRE/POST ---------------------------
     def preprocess(self, image):
@@ -446,9 +481,6 @@ class DetectorAndTracker:
             'total': total_time
         }
 
-    
-  
-
             
     # core
     def detect_and_track(self, frame, debug=False, return_vis=False):
@@ -506,6 +538,9 @@ class DetectorAndTracker:
             if not track.is_confirmed():
                 continue
             tid = track.track_id
+
+            # local_id_set: 같은 local id에 대해서 요청을 한번만 보내기 위한 set
+            # pending_reid: ReID 요청을 보냈지만 아직 응답(= global_id 매핑)을 받지 못한 local_id 집합.
             if tid in self.local_id_set or tid in self.pending_reid:
                 continue
 
@@ -526,32 +561,25 @@ class DetectorAndTracker:
                 class_name="person",
                 encoding="base64",
                 idempotency_key=idemp
-            )
+            )     
 
-            
-            print(f'{tid} is sent') # for debugging
-    
-            self.pending_reid.add(tid)
-            self.local_id_set.add(tid)
-            # 등장 시각 기록(세션 시작)
-            self.track_start_ts.setdefault(tid, int(time.time() * 1000))
+            with self._state_lock:
+                self.pending_reid.add(tid)
+                self.local_id_set.add(tid)
+                self.track_start_ts.setdefault(tid, int(time.time() * 1000))
+                self.track_lifecycle[tid] = {
+                    "start_ms": self.track_start_ts[tid],
+                    "status": "reid_pending",
+                    "gid": None,
+                    "detection_id": None,
+                }
         
+        # 객체가 마지막으로 관측된 시간 DB에 업데이트
         curr_ids = {t.track_id for t in tracks if t.is_confirmed()}
         ended = set(self.track_start_ts.keys()) - curr_ids
         now_ms = int(time.time() * 1000)
         for lid in list(ended):
-            det_id = self.local_to_detection.get(lid)
-            if det_id:
-                try:
-                    self.db.updateDetectionExitTime(det_id, now_ms)
-                except Exception as e:
-                    print(f"DB updateDetectionExitTime failed: det_id={det_id}, err={e}")
-            # 상태 정리
-            self.track_start_ts.pop(lid, None)
-            self.local_to_detection.pop(lid, None)
-            self.local_to_global.pop(lid, None)
-            self.pending_reid.discard(lid)
-            self.local_id_set.discard(lid)
+            self._finalize_track(lid, exit_ms=now_ms)
 
         # 5) return_vis = True인 경우 시각화 프레임 return 
         if return_vis:

@@ -19,6 +19,7 @@ from torchvision import transforms
 
 
 from db_util.db_util import PostgreSQL
+from datetime import datetime
 
 
 class ReIDService:
@@ -72,7 +73,18 @@ class ReIDService:
             self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
 
     def _init_model(self):
-        """OSNet feature extractor 로드."""
+        # 출력 임베드 차원 확인할 것 e.g. resnet152 = 2048
+
+        """OSNet feature extractor 로드.    
+            torchreid.models.show_avai_models()
+            ['resnet18', 'resnet34', 'resnet50', 'resnet101', 'resnet152', 'resnext50_32x4d', 'resnext101_32x8d', 'resnet50_fc512', 
+            'se_resnet50', 'se_resnet50_fc512', 'se_resnet101', 'se_resnext50_32x4d', 'se_resnext101_32x4d', 'densenet121', 'densenet169', 
+            'densenet201', 'densenet161', 'densenet121_fc512', 'inceptionresnetv2', 'inceptionv4', 'xception', 'resnet50_ibn_a', 'resnet50_ibn_b', 
+            'nasnsetmobile', 'mobilenetv2_x1_0', 'mobilenetv2_x1_4', 'shufflenet', 'squeezenet1_0', 'squeezenet1_0_fc512', 'squeezenet1_1', 
+            'shufflenet_v2_x0_5', 'shufflenet_v2_x1_0', 'shufflenet_v2_x1_5', 'shufflenet_v2_x2_0', 'mudeep', 'resnet50mid', 'hacnn', 'pcb_p6', 
+            'pcb_p4', 'mlfn', 'osnet_x1_0', 'osnet_x0_75', 'osnet_x0_5', 'osnet_x0_25', 'osnet_ibn_x1_0', 'osnet_ain_x1_0', 'osnet_ain_x0_75', 
+            'osnet_ain_x0_5', 'osnet_ain_x0_25']
+        """
         # osnet_x1_0은 512-d 임베딩을 출력
         self.model = torchreid.models.build_model(
             name='osnet_x1_0',
@@ -165,7 +177,7 @@ class ReIDService:
                     return int(I[0][0]), True
 
             # 신규 등록
-            new_id = uuid.uuid4().int & ((1 << 63) - 1)
+            new_id = str(uuid.uuid4().int & ((1 << 63) - 1))
             self.index.add_with_ids(feat_vec, np.array([new_id], dtype='int64'))
 
             try:

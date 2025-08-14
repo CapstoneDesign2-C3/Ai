@@ -14,7 +14,7 @@ def main():
     load_env()
 
     client = nvr_client.NVRClient()
-    channel = client.NVRChannelList[0]
+    channel = client.NVRChannelList[1]
     channel.connect()
     camera_id = channel.camera_id
     cap = channel.cap  # OpenCV FFMPEG 백엔드

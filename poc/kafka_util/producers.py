@@ -213,6 +213,7 @@ class TrackResultProducer(BaseProducer):
         confidence: Optional[float] = None,
         class_name: Optional[str] = None,
         local_id: Optional[int] = None,
+        idempotency_key: Optional[str] = None
     ) -> Dict[str, Any]:
         try:
             msg = {
@@ -221,6 +222,7 @@ class TrackResultProducer(BaseProducer):
                 "timestamp": _now_ms(),
                 "image_format": "jpeg",
                 "encoding": "base64",
+                "idempotency_key": idempotency_key,
             }
             if track_id is not None:
                 msg["track_id"] = track_id
@@ -240,7 +242,7 @@ class TrackResultProducer(BaseProducer):
             ]
             return self._send(
                 key=self.camera_id.encode("utf-8"),
-                value=msg,  # value_serializer가 JSON으로 직렬화
+                value=msg,
                 headers=headers,
             )
         except Exception as e:
@@ -259,7 +261,7 @@ class TrackResultProducer(BaseProducer):
         idempotency_key: Optional[str] = None
     ) -> Dict[str, Any]:
         """
-        encoding='base64' 권장(서비스 포맷 부합). 'binary'도 지원.
+        encoding='base64'
         """
         try:
             ok, buf = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 90])
@@ -275,6 +277,7 @@ class TrackResultProducer(BaseProducer):
                     confidence=confidence,
                     class_name=class_name,
                     local_id=track_id,
+                    idempotency_key=idempotency_key,
                 )
             elif encoding == "binary":
                 headers = [
