@@ -1,19 +1,33 @@
-from kafka import KafkaConsumer, TopicPartition
-from dotenv import load_dotenv
+"""
+Refactored Kafka consumers for camera-partitioned streams.
+- Unifies common logic in a small base class (partition assignment, metadata wait, poll loop, logging, stop/close).
+- Fixes a bug where `last_log` was referenced without `self.` in FrameConsumer.run.
+- Adds rate-limited position/end logging and graceful shutdown.
+- Keeps the public API and factory functions stable.
+
+How it connects to DetectorAndTracker.on_reid_response:
+- ReIDResponseConsumer filters by camera_id and delivers dict payloads to the provided handler.
+- In your code, the handler is DetectorAndTracker.on_reid_response(data) which updates in-memory state and writes DB rows.
+"""
+from __future__ import annotations
+
 import os
-import cv2
-import numpy as np
 import json
 import time
 import logging
-from typing import Callable, Optional, Any, Dict, List
+from typing import Callable, Any, Dict, Optional
 from threading import Event
+
+import cv2
+import numpy as np
+from dotenv import load_dotenv
+from kafka import KafkaConsumer, TopicPartition
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
 
-# -------------------- dotenv loader (producers.py와 동일 철학) --------------------
-def _load_env_best_effort():
+# -------------------- dotenv loader (shared with producers.py philosophy) --------------------
+def _load_env_best_effort() -> None:
     tried = set()
     for p in (
         os.getenv("DOTENV_PATH"),
@@ -37,9 +51,8 @@ def _load_env_best_effort():
         pass
 
 
-# -------------------- Kafka Murmur2 (Java 호환) --------------------
+# -------------------- Kafka Murmur2 (Java-compatible) --------------------
 def _murmur2(data: bytes) -> int:
-    """Kafka(Java) 호환 Murmur2 해시 (positive only)"""
     seed = 0x9747b28c
     m = 0x5bd1e995
     r = 24
@@ -49,7 +62,12 @@ def _murmur2(data: bytes) -> int:
     length4 = length & ~0x03
 
     for i in range(0, length4, 4):
-        k = (data[i + 0] & 0xFF) | ((data[i + 1] & 0xFF) << 8) | ((data[i + 2] & 0xFF) << 16) | ((data[i + 3] & 0xFF) << 24)
+        k = (
+            (data[i + 0] & 0xFF)
+            | ((data[i + 1] & 0xFF) << 8)
+            | ((data[i + 2] & 0xFF) << 16)
+            | ((data[i + 3] & 0xFF) << 24)
+        )
         k = (k * m) & 0xFFFFFFFF
         k ^= (k >> r) & 0xFFFFFFFF
         k = (k * m) & 0xFFFFFFFF
@@ -73,12 +91,10 @@ def _murmur2(data: bytes) -> int:
     h ^= (h >> 13) & 0xFFFFFFFF
     h = (h * m) & 0xFFFFFFFF
     h ^= (h >> 15) & 0xFFFFFFFF
-    # Kafka는 양수로 변환
-    return h & 0x7fffffff
+    return h & 0x7FFFFFFF  # positive-only like Kafka
 
 
 def _partition_for_key(consumer: KafkaConsumer, topic: str, key: str) -> int:
-    """현재 클러스터 메타데이터 기준으로 camera_id가 갈 파티션 계산"""
     parts = consumer.partitions_for_topic(topic)
     if not parts:
         raise RuntimeError(f"Topic metadata not found: {topic}")
@@ -86,12 +102,129 @@ def _partition_for_key(consumer: KafkaConsumer, topic: str, key: str) -> int:
     return _murmur2(key.encode("utf-8")) % num
 
 
+# -------------------- Common base: single-partition, camera-keyed consumer --------------------
+class _PartitionedConsumerBase:
+    def __init__(
+        self,
+        *,
+        camera_id: str,
+        topic_env_key: str,
+        enable_auto_commit: bool,
+        auto_offset: str = "latest",
+        poll_timeout_ms: int = 200,
+        value_deserializer: Optional[Callable[[bytes], Any]] = None,
+    ) -> None:
+        _load_env_best_effort()
+
+        self.camera_id = str(camera_id)
+        self.stop_event = Event()
+        self.poll_timeout_ms = int(poll_timeout_ms)
+        self.last_log = 0.0
+
+        self.broker = os.getenv("BROKER")
+        self.topic = os.getenv(topic_env_key)
+        if not self.broker or not self.topic:
+            raise ValueError(f"BROKER 또는 {topic_env_key} 환경변수가 설정되지 않았습니다.")
+
+        conf: Dict[str, Any] = {
+            "bootstrap_servers": [self.broker],
+            "enable_auto_commit": bool(enable_auto_commit),
+            "auto_offset_reset": str(auto_offset),
+        }
+        if value_deserializer is not None:
+            conf["value_deserializer"] = value_deserializer
+
+        self.consumer = KafkaConsumer(**conf)
+        # Ensure metadata exists (fresh topics may take a moment)
+        self._ensure_metadata()
+
+        # Assign the camera-partition only
+        p = _partition_for_key(self.consumer, self.topic, self.camera_id)
+        self.tp = TopicPartition(self.topic, p)
+        self.consumer.assign([self.tp])
+
+        if auto_offset == "latest":
+            try:
+                self.consumer.seek_to_end(self.tp)
+            except Exception:
+                pass
+
+        try:
+            pos = self.consumer.position(self.tp)
+            end = self.consumer.end_offsets([self.tp])[self.tp]
+            logger.info(
+                f"[{self.__class__.__name__}] camera={self.camera_id} -> {self.topic} p={p} pos={pos} end={end}"
+            )
+        except Exception as e:
+            logger.info(
+                f"[{self.__class__.__name__}] camera={self.camera_id} -> {self.topic} p={p} (pos/end check failed: {e})"
+            )
+
+    def _ensure_metadata(self, timeout_s: float = 5.0) -> None:
+        deadline = time.time() + timeout_s
+        while time.time() < deadline:
+            try:
+                parts = self.consumer.partitions_for_topic(self.topic)
+                if parts:
+                    return
+            except Exception:
+                pass
+            time.sleep(0.1)
+        # fall-through: let assignment raise if still unavailable
+
+    def _log_position_rate_limited(self, interval_s: float = 1.0) -> None:
+        now = time.time()
+        if now - self.last_log < interval_s:
+            return
+        self.last_log = now
+        try:
+            pos = self.consumer.position(self.tp)
+            end = self.consumer.end_offsets([self.tp])[self.tp]
+            logger.info(f"[{self.__class__.__name__}] pos={pos} end={end}")
+        except Exception:
+            pass
+
+    # Subclasses must implement this
+    def _handle_record(self, msg) -> None:  # pragma: no cover (runtime path)
+        raise NotImplementedError
+
+    def run(self) -> None:
+        try:
+            while not self.stop_event.is_set():
+                records = self.consumer.poll(timeout_ms=self.poll_timeout_ms)
+                if not records:
+                    self._log_position_rate_limited()
+                    continue
+
+                self._log_position_rate_limited()
+
+                for _tp, msgs in records.items():
+                    for msg in msgs:
+                        try:
+                            # Filter by camera key if present
+                            if msg.key and msg.key.decode("utf-8") != self.camera_id:
+                                continue
+                            self._handle_record(msg)
+                        except Exception as e:
+                            logger.error(f"{self.__class__.__name__} handler error: {e}")
+        except KeyboardInterrupt:
+            logger.info(f"{self.__class__.__name__} interrupted")
+        finally:
+            try:
+                self.consumer.close()
+            except Exception:
+                pass
+            logger.info(f"{self.__class__.__name__} closed")
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+
 # -------------------- FrameConsumer --------------------
-class FrameConsumer:
+class FrameConsumer(_PartitionedConsumerBase):
     """
-    - FRAME_TOPIC에서 해당 camera_id가 매핑되는 파티션만 assign
-    - JPEG bytes → numpy frame 복원
-    - handler(frame, headers) 콜백 호출 (예: DetectorAndTracker.detect_and_track)
+    - Reads JPEG bytes from FRAME_TOPIC camera-partition
+    - Decodes to numpy frame and calls handler(frame, headers)
     """
     def __init__(
         self,
@@ -100,110 +233,37 @@ class FrameConsumer:
         *,
         auto_offset: str = "latest",
         poll_timeout_ms: int = 200,
-    ):
-        _load_env_best_effort()
-        self.camera_id = str(camera_id)
+    ) -> None:
         self.handler = handler
-
-        self.broker = os.getenv("BROKER")
-        self.topic = os.getenv("FRAME_TOPIC")
-
-        if not self.broker or not self.topic:
-            raise ValueError("BROKER 또는 FRAME_TOPIC 환경변수가 설정되지 않았습니다.")
-
-        # value는 bytes 그대로, key도 bytes
-        self.consumer = KafkaConsumer(
-            bootstrap_servers=[self.broker],
+        super().__init__(
+            camera_id=camera_id,
+            topic_env_key="FRAME_TOPIC",
             enable_auto_commit=False,
-            auto_offset_reset=auto_offset,
+            auto_offset=auto_offset,
+            poll_timeout_ms=poll_timeout_ms,
+            value_deserializer=None,
         )
-        self.stop_event = Event()
 
-        # 파티션 계산 및 assign
-        p = _partition_for_key(self.consumer, self.topic, self.camera_id)
-        tp = TopicPartition(self.topic, p)
-        self.consumer.assign([tp])
+    def _handle_record(self, msg) -> None:  # pragma: no cover
+        # JPEG bytes -> frame
+        buf = np.frombuffer(msg.value, dtype=np.uint8)
+        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
+        if frame is None:
+            logger.warning("Failed to decode frame; skip")
+            return
 
-        # latest부터 받고 싶으면 seek_to_end, 과거 포함이면 auto_offset_reset='earliest' + seek 생략
-        if auto_offset == "latest":
-            try:
-                self.consumer.seek_to_end(tp)
-            except Exception:
-                pass
-        
-        ''' for debugging'''
-        pos = self.consumer.position(tp)
-        logger.info(f"[FrameConsumer] assigned tp={tp} position={pos}")
-        
-        try:
-            pos = self.consumer.position(tp)
-            end = self.consumer.end_offsets([tp])[tp]
-            logger.info(f"[FrameConsumer] assigned tp={tp} position={pos} end={end}")
-        except Exception as e:
-            logger.warning(f"[FrameConsumer] pos/end check failed: {e}")
-
-        logger.info(f"[FrameConsumer] camera={self.camera_id} -> topic={self.topic} partition={p}")
-
-        self.poll_timeout_ms = int(poll_timeout_ms)
-
-    def run(self):
-        try:
-            while not self.stop_event.is_set():
-                records = self.consumer.poll(timeout_ms=self.poll_timeout_ms)
-                if not records:
-                    continue
-
-                if time.time() - last_log >= 1.0:
-                    try:
-                        tp = next(iter(self.consumer.assignment()))
-                        pos = self.consumer.position(tp)
-                        end = self.consumer.end_offsets([tp])[tp]
-                        logger.info(f"[FrameConsumer] pos={pos} end={end}")
-                    except Exception:
-                        pass
-                    last_log = time.time()
-
-                for tp, msgs in records.items():
-                    for msg in msgs:
-                        # 키 필터 (같은 파티션에 다른 camera_id가 올 가능성 희박하지만 안전하게 필터링)
-                        if msg.key and msg.key.decode("utf-8") != self.camera_id:
-                            continue
-
-                        # JPEG bytes → frame
-                        buf = np.frombuffer(msg.value, dtype=np.uint8)
-                        frame = cv2.imdecode(buf, cv2.IMREAD_COLOR)
-                        if frame is None:
-                            logger.warning("Failed to decode frame; skip")
-                            continue
-
-                        headers = {k: (v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else v)
-                                   for k, v in (msg.headers or [])}
-
-                        # 사용자 핸들러 호출
-                        try:
-                            self.handler(frame, headers)
-                        except Exception as e:
-                            logger.error(f"Handler error: {e}")
-
-        except KeyboardInterrupt:
-            logger.info("FrameConsumer interrupted")
-        finally:
-            try:
-                self.consumer.close()
-            except Exception:
-                pass
-            logger.info("FrameConsumer closed")
-
-    def stop(self):
-        self.stop_event.set()
+        headers = {
+            k: (v.decode("utf-8", "ignore") if isinstance(v, (bytes, bytearray)) else v)
+            for k, v in (msg.headers or [])
+        }
+        self.handler(frame, headers)
 
 
 # -------------------- ReIDResponseConsumer --------------------
-class ReIDResponseConsumer:
+class ReIDResponseConsumer(_PartitionedConsumerBase):
     """
-    - REID_RESPONSE_TOPIC에서 해당 camera_id가 매핑되는 파티션만 assign
-    - value: JSON → dict
-    - handler(response_dict) 콜백 호출 (예: DetectorAndTracker.on_reid_response)
+    - Reads dict payloads from REID_RESPONSE_TOPIC camera-partition
+    - Calls handler(response_dict) (e.g., DetectorAndTracker.on_reid_response)
     """
     def __init__(
         self,
@@ -212,85 +272,34 @@ class ReIDResponseConsumer:
         *,
         auto_offset: str = "latest",
         poll_timeout_ms: int = 200,
-    ):
-        _load_env_best_effort()
-        self.camera_id = str(camera_id)
+    ) -> None:
         self.handler = handler
-
-        self.broker = os.getenv("BROKER")
-        self.topic = os.getenv("REID_RESPONSE_TOPIC")
-
-        if not self.broker or not self.topic:
-            raise ValueError("BROKER 또는 REID_RESPONSE_TOPIC 환경변수가 설정되지 않았습니다.")
-
-        self.consumer = KafkaConsumer(
-            bootstrap_servers=[self.broker],
-            enable_auto_commit=True,             # 응답은 재처리 부담이 적어서 auto commit 허용
-            auto_offset_reset=auto_offset,
+        super().__init__(
+            camera_id=camera_id,
+            topic_env_key="REID_RESPONSE_TOPIC",
+            enable_auto_commit=True,  # responses are cheap to reprocess
+            auto_offset=auto_offset,
+            poll_timeout_ms=poll_timeout_ms,
             value_deserializer=lambda b: json.loads(b.decode("utf-8")),
         )
-        self.stop_event = Event()
 
-        p = _partition_for_key(self.consumer, self.topic, self.camera_id)
-        tp = TopicPartition(self.topic, p)
-        self.consumer.assign([tp])
+    def _handle_record(self, msg) -> None:  # pragma: no cover
+        data = msg.value
+        if not isinstance(data, dict):
+            logger.warning("Invalid response payload; skip")
+            return
 
-        if auto_offset == "latest":
-            try:
-                self.consumer.seek_to_end(tp)
-            except Exception:
-                pass
-        
-       
+        # Ensure camera_id match inside payload as well
+        if str(data.get("camera_id")) != self.camera_id:
+            return
 
-        logger.info(f"[ReIDResponseConsumer] camera={self.camera_id} -> topic={self.topic} partition={p}")
-
-        self.poll_timeout_ms = int(poll_timeout_ms)
-
-    def run(self):
-        try:
-            while not self.stop_event.is_set():
-                
-                records = self.consumer.poll(timeout_ms=self.poll_timeout_ms)
-                if not records:
-                    continue
-
-                for tp, msgs in records.items():
-                    for msg in msgs:
-                        # 같은 파티션에 다른 camera_id 응답이 섞일 수 있어 필터링
-                        if msg.key and msg.key.decode("utf-8") != self.camera_id:
-                            continue
-
-                        data = msg.value
-                        if not isinstance(data, dict):
-                            logger.warning("Invalid response payload; skip")
-                            continue
-
-                        # 안전하게 camera_id 매칭 확인
-                        if str(data.get("camera_id")) != self.camera_id:
-                            continue
-
-                        try:
-                            self.handler(data)
-                        except Exception as e:
-                            logger.error(f"Handler error: {e}")
-
-        except KeyboardInterrupt:
-            logger.info("ReIDResponseConsumer interrupted")
-        finally:
-            try:
-                self.consumer.close()
-            except Exception:
-                pass
-            logger.info("ReIDResponseConsumer closed")
-
-    def stop(self):
-        self.stop_event.set()
+        self.handler(data)
 
 
 # -------------------- Factories --------------------
 def create_frame_consumer(camera_id: str, handler: Callable[[np.ndarray, Dict[str, Any]], Any]) -> FrameConsumer:
     return FrameConsumer(camera_id=camera_id, handler=handler)
+
 
 def create_reid_response_consumer(camera_id: str, handler: Callable[[Dict[str, Any]], Any]) -> ReIDResponseConsumer:
     return ReIDResponseConsumer(camera_id=camera_id, handler=handler)
