@@ -239,6 +239,7 @@ class ReIDService:
             "local_id": local_id,
             "global_id": int(global_id),
             "existing": bool(is_exist),
+            "crop_img": image_base64,
             "status": "success",
             "elapsed_ms": round(elapsed, 2)
         }
@@ -247,7 +248,7 @@ class ReIDService:
         return response
 
 
-    def send_response(self, response: dict):
+    def send_response(self, response: dict):    
         """Kafka 응답 publish."""
         try:
             cam = response.get("camera_id")

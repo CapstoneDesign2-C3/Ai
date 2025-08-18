@@ -256,15 +256,21 @@ class DetectorAndTracker:
 
         return np.vstack(embs) if embs else None
 
+# ----------------------- Image Util -----------------------
+    def _pil_to_jpeg_bytes(self, img: Image.Image, quality=90) -> bytes:
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality)
+
+        return buf.getvalue()
+    
+
 # --------------------- track/reid util --------------------------
     def on_reid_response(self, data: dict):
         # parsing
         try:
             lid = int(data.get("local_id", data.get("track_id", -1)))
-        except (TypeError, ValueError):
-            return
-        try:
             gid = int(data.get("global_id", -1))
+            crop = self._pil_to_jpeg_bytes(Image.open(io.BytesIO(base64.b64decode(data.get("crop_img")))).convert('RGB'))
         except (TypeError, ValueError):
             return
         if gid <= 0 or lid < 0:
@@ -289,7 +295,7 @@ class DetectorAndTracker:
             self.inflight_reid.add(lid)
 
         try:
-            det_id = self.db.addNewDetection(uuid=str(gid), appeared_time=appeared_ms, exit_time=None, camera_id=self.camera_id, crop_img=None)
+            det_id = self.db.addNewDetection(uuid=str(gid), appeared_time=appeared_ms, exit_time=None, crop_img=crop)
         except Exception as e:
             # 실패 시 inflight 해제만 하고 리턴(재시도 전략은 후속)
             with self._state_lock:
@@ -327,7 +333,7 @@ class DetectorAndTracker:
         success = False
         if det_id:
             try:
-                self.db.updateDetectionExitTime(det_id, now_ms)
+                self.db.updateDetectionExitTime(det_id, now_ms, camera_id=self.camera_id)
                 success = True
             except Exception as e:
                 print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
