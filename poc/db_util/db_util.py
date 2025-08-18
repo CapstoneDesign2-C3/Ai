@@ -70,7 +70,7 @@ class PostgreSQL:
 
         
     # 퇴장 시간 업데이트를 위한 메서드
-    def updateDetectionExitTime(self, detection_id, exit_time):
+    def updateDetectionExitTime(self, detection_id, exit_time, camera_id):
         """
         exit_time: epoch ms(int) 또는 datetime
         """
@@ -81,19 +81,33 @@ class PostgreSQL:
         else:
             raise TypeError("exit_time must be epoch ms or datetime")
 
+
         with self.db.cursor() as cursor:
+            cursor.execute(
+                """
+                INSERT INTO video (camera_id)
+                VALUES (%d)
+                RETURNING id
+                """
+                , (camera_id))
+            
+            video_id = cursor.fetchone()[0]
+
             cursor.execute(
                 """
                 UPDATE detection
                 SET exit_time = GREATEST(COALESCE(exit_time, %s), %s)
+                    video_id = %s
                 WHERE id = %s
                 """,
-                (exit_dt, exit_dt, detection_id)
+                (exit_dt, exit_dt, video_id, detection_id)
             )
             if cursor.rowcount != 1:
                 raise ValueError(f"Detection not found or not updated (id={detection_id})")
         self.db.commit()
         print(f'updateDetectionExitTime : det id = {detection_id}')
+
+        
 
     def getCameraInfo(self):
         with self.db.cursor() as cursor:
