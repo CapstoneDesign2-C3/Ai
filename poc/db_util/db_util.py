@@ -32,7 +32,7 @@ class PostgreSQL:
         print(f'uuid : {uuid} is insert')   # for debugging
 
 
-    def addNewDetection(self, video_id, crop_img, uuid, appeared_time, exit_time=None):
+    def addNewDetection(self, crop_img, uuid, appeared_time, exit_time=None):
         with self.db.cursor() as cursor:
             cursor.execute("BEGIN;")
             cursor.execute("SELECT id FROM detected_object WHERE uuid = %s FOR SHARE", (uuid,))
@@ -59,10 +59,10 @@ class PostgreSQL:
                 """, (utc_appeared, det_id))
             else:
                 cursor.execute("""
-                    INSERT INTO detection (detected_object_id, appeared_time, exit_time, video_id, crop_img)
-                    VALUES (%s, %s, %s, %d, %s)
+                    INSERT INTO detection (detected_object_id, appeared_time, exit_time, crop_img)
+                    VALUES (%s, %s, %s, %s)
                     RETURNING id
-                """, (detected_object_id, utc_appeared, exit_time, video_id, psycopg2.Binary(crop_img)))
+                """, (detected_object_id, utc_appeared, exit_time, psycopg2.Binary(crop_img)))
                 det_id = cursor.fetchone()[0]
 
             cursor.execute("COMMIT;")
@@ -86,22 +86,25 @@ class PostgreSQL:
             cursor.execute(
                 """
                 INSERT INTO video (camera_id)
-                VALUES (%d)
+                VALUES (%s)
                 RETURNING id
                 """
-                , (camera_id))
+                , (camera_id, ))
+            
             
             video_id = cursor.fetchone()[0]
-
+            
             cursor.execute(
                 """
                 UPDATE detection
-                SET exit_time = GREATEST(COALESCE(exit_time, %s), %s)
-                    video_id = %s
+                SET exit_time = GREATEST(COALESCE(exit_time, %s), %s),
+                    video_id  = %s
                 WHERE id = %s
+
                 """,
                 (exit_dt, exit_dt, video_id, detection_id)
             )
+
             if cursor.rowcount != 1:
                 raise ValueError(f"Detection not found or not updated (id={detection_id})")
         self.db.commit()
