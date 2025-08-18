@@ -2,6 +2,11 @@ import os, time, cv2, numpy as np
 from dotenv import load_dotenv
 from nvr_util import nvr_client
 from tracking_module.detection_and_tracking import DetectorAndTracker
+import logging
+logging.basicConfig(level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s:%(lineno)d - %(message)s")
+logging.getLogger("kafka.coordinator").setLevel(logging.INFO)  # 너무 시끄러우면 INFO
+
 
 def load_env():
     for p in (os.getenv("DOTENV_PATH"),
@@ -57,6 +62,9 @@ def main():
     last_t = time.time()
     frame_cnt = 0
     fps = 0.0
+
+    logger = logging.getLogger("nvr")
+    logger.info("NVR open start: camID=%d", camera_id)
 
     try:
         while True:

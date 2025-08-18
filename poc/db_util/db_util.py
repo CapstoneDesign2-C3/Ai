@@ -32,42 +32,42 @@ class PostgreSQL:
         print(f'uuid : {uuid} is insert')   # for debugging
 
 
-    def addNewDetection(self, uuid, appeared_time, exit_time=None):
-        """
-        appeared_time: datetime
-        exit_time: Optional[datetime] (미정이면 None)
-        """
-        try:
-            with self.db.cursor() as cursor:
-                # 트랜잭션 시작
-                cursor.execute("BEGIN;")
+    def addNewDetection(self, video_id, crop_img, uuid, appeared_time, exit_time=None):
+        with self.db.cursor() as cursor:
+            cursor.execute("BEGIN;")
+            cursor.execute("SELECT id FROM detected_object WHERE uuid = %s FOR SHARE", (uuid,))
+            row = cursor.fetchone()
+            if row is None:
+                raise ValueError(f"uuid({uuid})가 detected_object에 없습니다.")
+            detected_object_id = row[0]
 
-                cursor.execute(
-                    "SELECT id FROM detected_object WHERE uuid = %s FOR SHARE",
-                    (uuid,)
-                )
-                row = cursor.fetchone()
-                if row is None:
-                    raise ValueError(f"uuid({uuid})가 detected_object에 없습니다.")
-                detected_object_id = row[0]
+            utc_appeared = datetime.utcfromtimestamp(appeared_time/1000.0)
 
-                utc_appeared_time = datetime.utcfromtimestamp(appeared_time / 1000.0)
-                cursor.execute(
-                    """
-                    INSERT INTO detection (detected_object_id, appeared_time, exit_time)
-                    VALUES (%s, %s, %s)
+            # 같은 객체의 '열린' 세션이 있으면 잡아서 재사용 (동시에 들어와도 FOR UPDATE로 직렬화)
+            cursor.execute("""
+                SELECT id FROM detection
+                WHERE detected_object_id = %s AND exit_time IS NULL
+                FOR UPDATE
+            """, (detected_object_id,))
+            open_row = cursor.fetchone()
+            if open_row:
+                det_id = open_row[0]
+                cursor.execute("""
+                    UPDATE detection
+                    SET appeared_time = LEAST(appeared_time, %s)
+                    WHERE id = %s
+                """, (utc_appeared, det_id))
+            else:
+                cursor.execute("""
+                    INSERT INTO detection (detected_object_id, appeared_time, exit_time, video_id, crop_img)
+                    VALUES (%s, %s, %s, %d, %s)
                     RETURNING id
-                    """,
-                    (detected_object_id, utc_appeared_time, exit_time)
-                )
+                """, (detected_object_id, utc_appeared, exit_time, video_id, psycopg2.Binary(crop_img)))
                 det_id = cursor.fetchone()[0]
-                print(f'uuid : {uuid} is updated: add new detection')   # for debugging
-                cursor.execute("COMMIT;")
-                return det_id
-        except Exception:
-            with self.db.cursor() as c2:
-                c2.execute("ROLLBACK;")
-            raise
+
+            cursor.execute("COMMIT;")
+            return det_id
+
         
     # 퇴장 시간 업데이트를 위한 메서드
     def updateDetectionExitTime(self, detection_id, exit_time):
@@ -83,12 +83,18 @@ class PostgreSQL:
 
         with self.db.cursor() as cursor:
             cursor.execute(
-                "UPDATE detection SET exit_time = GREATEST(COALESCE(exit_time, %s), %s) WHERE id = %s;",
-                (exit_dt, detection_id)
+                """
+                UPDATE detection
+                SET exit_time = GREATEST(COALESCE(exit_time, %s), %s)
+                WHERE id = %s
+                """,
+                (exit_dt, exit_dt, detection_id)
             )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Detection not found or not updated (id={detection_id})")
         self.db.commit()
-        print(f'updateDetectionExitTime : det id = {detection_id}')   # for debugging
-    
+        print(f'updateDetectionExitTime : det id = {detection_id}')
+
     def getCameraInfo(self):
         with self.db.cursor() as cursor:
             cursor.execute(

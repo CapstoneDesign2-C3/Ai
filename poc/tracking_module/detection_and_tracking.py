@@ -24,7 +24,7 @@ from datetime import datetime
 
 
 class DetectorAndTracker:
-    def __init__(self, class_names_path=None, conf_threshold=0.25, iou_threshold=0.45, cameraID=None,
+    def __init__(self, class_names_path=None, conf_threshold=0.45, iou_threshold=0.35, cameraID=None,
                  tracker_type: str = "bytetrack"):
         """
         TensorRT YOLOv11 + DeepSORT (PyTorch) 통합
@@ -48,6 +48,10 @@ class DetectorAndTracker:
         # lifecycle: lid -> {"start_ms": int, "status": "reid_pending"|"active"|"end_scheduled", "gid": Optional[int], "detection_id": Optional[int]}  
         self.track_lifecycle = {}               
         self._state_lock = threading.Lock()     # 멀티 스레드 환경에서 race condition 관리
+        self.inflight_reid = set()  
+        self.end_deadlines = {}  # lid -> deadline_ms
+        self.end_grace_ms = int(os.getenv("END_GRACE_MS", "1500"))  # 1.5s 기본
+
 
 
         self.db = PostgreSQL(os.getenv('DB_HOST'), os.getenv('DB_NAME'),
@@ -253,48 +257,8 @@ class DetectorAndTracker:
         return np.vstack(embs) if embs else None
 
 # --------------------- track/reid util --------------------------
-    '''
     def on_reid_response(self, data: dict):
-        lid = int(data.get("local_id", data.get("track_id", -1)))
-        gid = int(data.get("global_id", -1))
-        print("on_reid_response")
-        if gid <= 0 or lid < 0:
-            return
-        print(f'pass gid : {gid}, lid : {lid}')
-        with self._state_lock:
-            # 매핑/대기 해제
-            self.local_to_global[lid] = gid
-            self.pending_reid.discard(lid)
-            # 중복 응답 방지
-            if self.local_to_detection.get(lid):
-                return
-            # start_ms가 정리되어도 안전하게 now_ms 폴백
-            appeared_ms = self.track_start_ts.get(lid, int(time.time() * 1000))
-            # DB는 UTC 기준으로 저장
-            appeared_dt = datetime.utcfromtimestamp(appeared_ms / 1000.0)
-
-        print(f'appeard_dt : {appeared_dt}')
-        # DB Insert: exit_time=None
-        try:
-            det_id = self.db.addNewDetection(
-                uuid=str(gid),
-                appeared_time=appeared_dt,
-                exit_time=None  # ⭐ 중요 변경: NULL 저장
-            )
-            with self._state_lock:
-                self.local_to_detection[lid] = det_id
-                self.track_lifecycle.setdefault(lid, {})["status"] = "active"
-                status = self.track_lifecycle.get(lid, {}).get("status")
-            # 종료 예약되어 있던 트랙은 즉시 finalize
-            if status == "end_scheduled":
-                self._finalize_track(lid)
-        except Exception as e:
-            print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
-            # TODO: 실패시 어떻게 처리할지.
-    '''
-
-    def on_reid_response(self, data: dict):
-        # 1) ID 파싱 & 검증
+        # parsing
         try:
             lid = int(data.get("local_id", data.get("track_id", -1)))
         except (TypeError, ValueError):
@@ -305,51 +269,42 @@ class DetectorAndTracker:
             return
         if gid <= 0 or lid < 0:
             return
-
-        print("on_reid_response")
-        print(f"pass gid : {gid}, lid : {lid}")
-
-        # 2) 상태 조회/업데이트는 락 안에서
+        
         with self._state_lock:
-            # 이미 처리된 트랙이면 중복 방지
-            if self.local_to_detection.get(lid):
+            # 이미 처리됐으면 중복 방지
+            if self.local_to_detection.get(lid) or lid in self.inflight_reid:
                 return
-
+            
             # 매핑/대기 해제
             self.local_to_global[lid] = gid
             self.pending_reid.discard(lid)
 
-            # start_ms가 없으면 now_ms로 폴백
-            appeared_ms = int(self.track_start_ts.get(lid, int(time.time() * 1000)))
-            status = self.track_lifecycle.setdefault(lid, {}).get("status", "active")
-            # 상태 초기화
-            self.track_lifecycle[lid]["status"] = "active"
+            # appeared_ms 결정
+            if lid not in self.track_start_ts:
+                self.track_start_ts[lid] = int(time.time()*1000)
+            appeared_ms = self.track_start_ts[lid]
+            self.track_lifecycle.setdefault(lid, {})["status"] = "active"
 
-        # 디버깅용 로그 (UTC 기준으로 사람이 보기 좋게만 출력)
-        appeared_dt = datetime.utcfromtimestamp(appeared_ms / 1000.0)
-        print(f"appeared_dt(UTC) : {appeared_dt} | appeared_ms : {appeared_ms}")
+            # ✅ DB 삽입 진행중 표식
+            self.inflight_reid.add(lid)
 
-        # 3) DB Insert: addNewDetection은 epoch ms를 기대하므로 ms(int) 그대로 전달
         try:
-            det_id = self.db.addNewDetection(
-                uuid=str(gid),
-                appeared_time=appeared_ms,   # ★ ms 정수로 전달 (중요)
-                exit_time=None               # NULL 저장
-            )
-
-            # 4) DB 성공 후에만 상태 확정 (락 내부에서)
-            with self._state_lock:
-                self.local_to_detection[lid] = det_id
-                # (다시 읽어 확인—다른 스레드가 end 예약했을 수 있음)
-                status = self.track_lifecycle.get(lid, {}).get("status")
-
-            # 5) 종료 예약되어 있던 트랙이면 즉시 finalize
-            if status == "end_scheduled":
-                self._finalize_track(lid)
-
+            det_id = self.db.addNewDetection(uuid=str(gid), appeared_time=appeared_ms, exit_time=None, camera_id=self.camera_id, crop_img=None)
         except Exception as e:
-            print(f"DB addNewDetection failed on response: local {lid} -> global {gid}: {e}")
-            # TODO: 실패 시 재시도 큐에 넣거나, 알림/로그 적재 등 정책 결정
+            # 실패 시 inflight 해제만 하고 리턴(재시도 전략은 후속)
+            with self._state_lock:
+                self.inflight_reid.discard(lid)
+            print(f"addNewDetection failed: lid={lid}, gid={gid}, err={e}")
+            return
+
+        # 성공 후에만 확정
+        with self._state_lock:
+            self.local_to_detection[lid] = det_id
+            self.inflight_reid.discard(lid)
+            status = self.track_lifecycle.get(lid, {}).get("status")
+
+        if status == "end_scheduled":
+            self._finalize_track(lid)
 
 
     def _finalize_track(self, lid: int, *, exit_ms: int | None = None):
@@ -361,30 +316,31 @@ class DetectorAndTracker:
         """
         now_ms = int(time.time() * 1000) if exit_ms is None else exit_ms
 
+        # 1) 상태 점검/결정은 락 안에서
         with self._state_lock:
-            # ReID 응답 대기 중이면 예약만 표시하고 리턴
             if lid not in self.local_to_detection and lid in self.pending_reid:
-                self.track_lifecycle.setdefault(lid, {})
-                self.track_lifecycle[lid]["status"] = "end_scheduled"
+                self.track_lifecycle.setdefault(lid, {})["status"] = "end_scheduled"
                 return
-
             det_id = self.local_to_detection.get(lid)
 
+        # 2) DB 업데이트는 락 밖에서
+        success = False
         if det_id:
             try:
                 self.db.updateDetectionExitTime(det_id, now_ms)
+                success = True
             except Exception as e:
                 print(f"updateDetectionExitTime failed: det_id={det_id}, err={e}")
 
-        # 상태 정리
-        with self._state_lock:
-            self.local_to_detection.pop(lid, None)
-            self.local_to_global.pop(lid, None)
-            self.track_start_ts.pop(lid, None)
-            self.pending_reid.discard(lid)
-            self.local_id_set.discard(lid)
-            # lifecycle 끝
-            self.track_lifecycle.pop(lid, None)
+        # 3) 성공한 경우에만 정리 (락 재획득)
+        if success:
+            with self._state_lock:
+                self.local_to_detection.pop(lid, None)
+                self.local_to_global.pop(lid, None)
+                self.track_start_ts.pop(lid, None)
+                self.pending_reid.discard(lid)
+                self.local_id_set.discard(lid)
+                self.track_lifecycle.pop(lid, None)
 
 
     # --------------------- PRE/POST ---------------------------
@@ -638,11 +594,25 @@ class DetectorAndTracker:
         
         # 객체가 마지막으로 관측된 시간 DB에 업데이트
         curr_ids = {t.track_id for t in tracks if t.is_confirmed()}
-        ended = set(self.track_start_ts.keys()) - curr_ids
         now_ms = int(time.time() * 1000)
-        for lid in list(ended):
-            # 종료 처리는 항상 단일 진입점으로
-            self._finalize_track(lid, exit_ms=now_ms)
+        # 2-1) 현재 보이는 트랙은 데드라인 제거
+        with self._state_lock:
+            for lid in list(self.end_deadlines.keys()):
+                if lid in curr_ids:
+                    self.end_deadlines.pop(lid, None)
+
+        # 2-2) 이번 프레임에 사라진 lid는 데드라인 설정(최초 1회)
+        ended = set(self.track_start_ts.keys()) - curr_ids
+        with self._state_lock:
+            for lid in ended:
+                self.end_deadlines.setdefault(lid, now_ms + self.end_grace_ms)
+
+        # 2-3) 데드라인이 지난 트랙만 실제 finalize
+        for lid, ddl in list(self.end_deadlines.items()):
+            if now_ms >= ddl:
+                self._finalize_track(lid, exit_ms=ddl)
+                with self._state_lock:
+                    self.end_deadlines.pop(lid, None)
 
         # 5) return_vis = True인 경우 시각화 프레임 return 
         if return_vis:
