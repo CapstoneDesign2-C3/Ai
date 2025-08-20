@@ -296,7 +296,7 @@ class ReIDService:
 
 if __name__ == "__main__":
     # .env에서 DB 연결정보 읽어 DB 핸들 생성 후 서비스 기동
-    load_dotenv('/home/hiperwall/Ai_modules/Ai/env/aws.env')
+    load_dotenv('../env/aws.env')
     db = PostgreSQL(
         os.getenv('DB_HOST'), os.getenv('DB_NAME'),
         os.getenv('DB_USER'), os.getenv('DB_PASSWORD'),

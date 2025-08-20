@@ -20,6 +20,7 @@ def _load_env_best_effort():
         "/home/hiperwall/Ai_modules/Ai/env/aws.env",
         "env/aws.env",
         ".env",
+        "../env/aws.env"
     ):
         if not p or p in tried:
             continue
