@@ -1,0 +1,41 @@
+name: tracker
+channels:
+  - conda-forge
+  - defaults
+
+channel_priority: strict
+
+dependencies:
+  # ── conda는 최소만: 파이썬 + 빌드/DB 필수
+  - python=3.10
+  - pycuda=2023.1
+  - pip
+  - setuptools
+  - wheel
+  - psycopg2  # db_util.PostgreSQL 에서 사용. (원하면 pip의 psycopg2-binary로 대체 가능)
+
+  # lap / lapx 중 하나만 필요. 코드가 lap→실패시 lapx로 대체하므로 lapx만 둬도 됨.
+  # conda lap을 쓰고 싶으면 아래 pip: lapx를 빼고 conda의 lap을 추가하세요.
+  # - lap=0.4.0
+
+  - pip:
+      - --extra-index-url https://download.pytorch.org/whl/cu124
+
+      # === 실제 import되는 것들만 ===
+      - numpy==1.25.2
+      - opencv-python==4.8.1.78
+      - python-dotenv==1.1.1          # 모듈명: dotenv
+      - kafka-python==2.2.15          # 모듈명: kafka
+      - Pillow==11.0.0                # 모듈명: PIL
+      - faiss-gpu==1.7.2              # 모듈명: faiss
+      - torch==2.5.1+cu124
+      - torchvision==0.20.1+cu124
+      - torchreid==0.2.5
+      - ocsort==0.0.2
+      - lapx==0.5.11.post1            # lap 대체안 (코드에서 fallback)
+      # - pycuda==2023.1                # ★ conda가 아닌 pip로 설치
+      - tensorrt==10.13.0.35
+      - tensorrt-cu12==10.13.0.35
+      - tensorrt-cu12-bindings==10.13.0.35
+      - tensorrt-cu12-libs==10.13.0.35
+      - scipy==1.9.3

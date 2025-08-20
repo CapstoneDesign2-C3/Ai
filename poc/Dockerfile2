@@ -1,0 +1,124 @@
+# syntax=docker/dockerfile:1.6
+
+############################
+# 0) pycuda wheel 빌더 (CUDA headers 필요)
+#    - 이 스테이지에서만 CUDA Toolkit 헤더/컴파일러 사용
+############################
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS pycuda-wheel
+
+# 빌드 도구 + 파이썬
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3-pip python3-dev build-essential && \
+    rm -rf /var/lib/apt/lists/*
+
+# 휠 빌드에 필요한 최소 패키지
+RUN python3 -m pip install -U pip wheel numpy
+
+# pycuda 2023.1 휠 생성 (CUDA headers 사용)
+RUN CUDAHOSTCXX=/usr/bin/g++ python3 -m pip wheel pycuda==2023.1 -w /wheels
+
+
+############################
+# 1) Base (micromamba env)
+############################
+FROM mambaorg/micromamba:1.5.8 AS base
+
+# micromamba RUN/SHELL 활성화
+ARG MAMBA_DOCKERFILE_ACTIVATE=1
+
+# 작업 디렉터리
+WORKDIR /app/poc
+
+# C 확장 빌드 도구 (일부 pip 패키지 대비)
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config python3-dev && \
+    rm -rf /var/lib/apt/lists/*
+USER $MAMBA_USER
+
+# ── conda env 최소 생성 (environment.yml은 python/pip/setuptools/wheel/psycopg2 정도만)
+COPY poc/environment.yml ./environment.yml
+RUN micromamba create -y -n app -f environment.yml && micromamba clean -ya
+
+# 이후 RUN/CMD는 conda env(app) 안에서 실행
+SHELL ["micromamba", "run", "-n", "app", "/bin/bash", "-lc"]
+
+# pip 기본 정책: 바이너리 우선
+ENV PIP_NO_INPUT=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_PREFER_BINARY=1
+
+# (1) numpy 먼저 (lap/확장 모듈들이 numpy 헤더 필요)
+RUN pip install --no-cache-dir numpy==1.26.4
+
+# (2) PyTorch/cu124
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.5.1+cu124 torchvision==0.20.1+cu124
+
+# (3) 일반 패키지
+RUN pip install --no-cache-dir \
+    opencv-python==4.8.1.78 \
+    Pillow==11.0.0 \
+    python-dotenv==1.1.1 \
+    kafka-python==2.2.15 \
+    torchreid==0.2.5 \
+    faiss-cpu==1.7.4
+
+# (4) lap 회피: lapx 먼저, 그 다음 ocsort는 --no-deps
+RUN pip install --no-cache-dir lapx==0.5.11.post1 filterpy==1.4.5
+RUN pip install --no-cache-dir ocsort==0.0.2 --no-deps
+
+# (5) TensorRT/cu12 묶음
+RUN pip install --no-cache-dir \
+    tensorrt==10.13.0.35 \
+    tensorrt-cu12==10.13.0.35 \
+    tensorrt-cu12-bindings==10.13.0.35 \
+    tensorrt-cu12-libs==10.13.0.35
+
+# (6) pycuda: 빌드 스테이지에서 만든 wheel 사용 (dev toolkit 없이 설치)
+COPY --from=pycuda-wheel /wheels/pycuda-2023.1-*.whl /tmp/
+RUN pip install --no-cache-dir /tmp/pycuda-2023.1-*.whl && rm -f /tmp/pycuda-2023.1-*.whl
+
+# ── 공용 코드 복사
+COPY poc/db_util                ./db_util
+COPY poc/kafka_util             ./kafka_util
+COPY poc/nvr_util               ./nvr_util
+COPY poc/cp_that.py             ./cp_that.py
+COPY poc/eval.py                ./eval.py
+COPY poc/smoke_test_one_cam.py  ./smoke_test_one_cam.py
+COPY poc/test_engine.py         ./test_engine.py
+
+# ── 공통 환경 변수
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Asia/Seoul \
+    PYTHONPATH=/app:/app/poc
+
+
+############################
+# 2) tracker 이미지 (tracking_module + yolo_engine)
+############################
+FROM base AS tracker
+WORKDIR /app/poc
+
+COPY poc/tracking_module ./tracking_module
+COPY poc/yolo_engine     ./yolo_engine
+
+# 엔진 경로(컨테이너 내부)
+ENV ENGINE_PATH=/app/poc/yolo_engine/yolo11m_fp16.engine
+
+ENTRYPOINT ["micromamba", "run", "-n", "app", "--no-capture-output"]
+CMD ["python", "smoke_test_one_cam.py"]
+
+
+############################
+# 3) reid 이미지 (reid_module만)
+############################
+FROM base AS reid
+WORKDIR /app/poc
+
+COPY poc/reid_module ./reid_module
+
+ENTRYPOINT ["micromamba", "run", "-n", "app", "--no-capture-output"]
+CMD ["python", "-m", "reid_module.reid_service"]
+
