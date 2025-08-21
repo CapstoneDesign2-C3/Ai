@@ -1,0 +1,15 @@
+# Build stage
+FROM python:3.10.18-slim AS builder
+WORKDIR /app
+RUN pip install --upgrade pip setuptools wheel
+RUN pip install --no-cache-dir numpy==1.25.2 torch torchvision opencv-python pillow psycopg2-binary kafka-python python-dotenv faiss-gpu torchreid scipy gdown tensorboard
+
+# Final stage
+FROM python:3.10.18-slim
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /usr/local/lib/python3.10/site-packages /usr/local/lib/python3.10/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY . /app/
+CMD ["python", "-m", "reid_module.reid_service"]
