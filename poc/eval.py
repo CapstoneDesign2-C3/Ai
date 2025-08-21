@@ -3,15 +3,8 @@ from pathlib import Path
 from collections import defaultdict
 import multiprocessing as mp
 import traceback
-# ... (중략: util, resolve_video_path 등 기존 함수 그대로 유지) ...
-
-from tracking_module.detection_and_tracking import DetectorAndTracker
-
-try:
-    import motmetrics as mm
-    _HAS_MOT = True
-except Exception:
-    _HAS_MOT = False
+from unicodedata import normalize
+import glob
 
 # ---- how to use -----
 '''
@@ -21,14 +14,19 @@ python eval.py \
   --out-root ./eval_out \
   --iou 0.3 --conf 0.25 \
   --tracker ocsort \
-  --nproc 4 \
-  --camera-ids 1,2,3,4
+  --nproc 4
 '''
 
-# --- 새로 추가 ---
-from unicodedata import normalize
-import glob
+# ---- 파이프라인 의존 (당신 코드) ----
+from tracking_module.detection_and_tracking import DetectorAndTracker
 
+try:
+    import motmetrics as mm
+    _HAS_MOT = True
+except Exception:
+    _HAS_MOT = False
+
+# ----------------- 파일명 보정 -----------------
 def resolve_video_path(video_dir: Path, file_name: str) -> Path:
     file_name = file_name.strip()
     file_name = normalize("NFC", file_name)
@@ -85,22 +83,85 @@ def iou_xywh(a, b):
     union = aw*ah + bw*bh - inter
     return inter / max(union, 1e-6)
 
-def _pick_bbox(ann):
-    for k in ("bbox","box","xywh"):
-        if k in ann and isinstance(ann[k], (list,tuple)) and len(ann[k])>=4:
-            x,y,w,h = ann[k][:4]
-            return float(x),float(y),float(w),float(h)
-    if all(k in ann for k in ("x","y","w","h")):
-        return float(ann["x"]),float(ann["y"]),float(ann["w"]),float(ann["h"])
-    if all(k in ann for k in ("x1","y1","x2","y2")):
-        x1,y1,x2,y2 = float(ann["x1"]),float(ann["y1"]),float(ann["x2"]),float(ann["y2"])
-        return x1,y1,max(0.0,x2-x1),max(0.0,y2-y1)
-    return None
-
 def _is_person_id(ann_id: str):
     return isinstance(ann_id, str) and ann_id.startswith("person_")
 
-def json_to_mot(json_path: Path, out_dir: Path):
+# --------- 좌표 판별/정규화 (xywh vs xyxy 자동) ----------
+def _normalize_bbox_list(bbox, img_w, img_h):
+    """
+    bbox(list/tuple[4])가 xywh인지 xyxy인지 자동 추정해서 xywh로 리턴
+    """
+    x0, y0, a2, b2 = map(float, bbox[:4])
+
+    # 후보 1: 입력이 xywh라고 가정
+    cand_xywh = (x0, y0, a2, b2)
+
+    # 후보 2: 입력이 xyxy라고 가정
+    w2 = max(0.0, a2 - x0)
+    h2 = max(0.0, b2 - y0)
+    cand_xyxy_as_xywh = (x0, y0, w2, h2)
+
+    def plausible(x, y, w, h):
+        if not all(map(math.isfinite, [x,y,w,h])): return False
+        if w <= 0 or h <= 0: return False
+        return (0 <= x <= img_w) and (0 <= y <= img_h) and (w <= img_w*1.1) and (h <= img_h*1.1)
+
+    p1 = plausible(*cand_xywh)
+    p2 = plausible(*cand_xyxy_as_xywh)
+
+    if p1 and not p2:
+        x,y,w,h = cand_xywh
+    elif p2 and not p1:
+        x,y,w,h = cand_xyxy_as_xywh
+    elif p1 and p2:
+        # 경계 초과 적은 쪽, 아니면 면적 작은 쪽
+        over1 = (cand_xywh[0]+cand_xywh[2] > img_w+1e-3) or (cand_xywh[1]+cand_xywh[3] > img_h+1e-3)
+        over2 = (cand_xyxy_as_xywh[0]+cand_xyxy_as_xywh[2] > img_w+1e-3) or (cand_xyxy_as_xywh[1]+cand_xyxy_as_xywh[3] > img_h+1e-3)
+        if over1 and not over2:
+            x,y,w,h = cand_xyxy_as_xywh
+        elif over2 and not over1:
+            x,y,w,h = cand_xywh
+        else:
+            area1 = cand_xywh[2]*cand_xywh[3]
+            area2 = cand_xyxy_as_xywh[2]*cand_xyxy_as_xywh[3]
+            x,y,w,h = (cand_xyxy_as_xywh if area2 < area1 else cand_xywh)
+    else:
+        return None
+
+    # 최종 클램프
+    x = max(0.0, min(x, img_w-1.0))
+    y = max(0.0, min(y, img_h-1.0))
+    w = max(1.0, min(w, img_w - x))
+    h = max(1.0, min(h, img_h - y))
+    return (x,y,w,h)
+
+def _pick_bbox(ann, img_w, img_h):
+    # 명시적 xyxy 우선
+    if all(k in ann for k in ("x1","y1","x2","y2")):
+        x1,y1,x2,y2 = float(ann["x1"]),float(ann["y1"]),float(ann["x2"]),float(ann["y2"])
+        x,y,w,h = x1, y1, max(0.0, x2-x1), max(0.0, y2-y1)
+    elif any(k in ann for k in ("bbox","box","xywh")):
+        raw = ann.get("bbox") or ann.get("box") or ann.get("xywh")
+        if isinstance(raw, (list,tuple)) and len(raw) >= 4:
+            norm = _normalize_bbox_list(raw, img_w, img_h)
+            if norm is None:
+                return None
+            x,y,w,h = norm
+        else:
+            return None
+    elif all(k in ann for k in ("x","y","w","h")):
+        x,y,w,h = float(ann["x"]),float(ann["y"]),float(ann["w"]),float(ann["h"])
+    else:
+        return None
+
+    # 경계 클램프
+    x = max(0.0, min(x, img_w-1.0))
+    y = max(0.0, min(y, img_h-1.0))
+    w = max(1.0, min(w, img_w - x))
+    h = max(1.0, min(h, img_h - y))
+    return (x,y,w,h)
+
+def json_to_mot(json_path: Path, out_dir: Path, *, img_w: int, img_h: int):
     data = json.loads(json_path.read_text(encoding="utf-8"))
     anns = data.get("annotations", []) or []
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -113,7 +174,7 @@ def json_to_mot(json_path: Path, out_dir: Path):
         ann_id = ann.get("id")
         if not _is_person_id(ann_id):
             continue
-        bb = _pick_bbox(ann)
+        bb = _pick_bbox(ann, img_w, img_h)
         if bb is None:
             continue
         x,y,w,h = bb
@@ -145,12 +206,6 @@ def load_gt(gt_txt: Path):
         per_frame[frame].append((tid, [x,y,w,h]))
     return per_frame
 
-try:
-    import motmetrics as mm
-    _HAS_MOT = True
-except Exception:
-    _HAS_MOT = False
-
 # ---- 워커 전역 (프로세스마다 딱 하나) ----
 _DT = None
 _CAM_ID = None
@@ -167,15 +222,14 @@ def _init_worker(camera_id: int, tracker: str, conf_thr: float):
     _TRACKER_KIND = tracker
     _CONF_THR = float(conf_thr)
 
-    # 한 번만 생성
     _DT = DetectorAndTracker(cameraID=_CAM_ID, tracker_type=_TRACKER_KIND, conf_threshold=_CONF_THR)
     print(f"[worker] camera_id={_CAM_ID} detector-tracker ready")
 
 
 def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
     """
-    기존 run_one에서 DetectorAndTracker 생성/해제 부분만 제거.
-    워커 전역 _DT 를 사용.
+    기존 run_one에서 DetectorAndTracker 생성/해제 부분 제거.
+    워커 전역 _DT 사용. GT 생성 전 비디오 크기 먼저 획득 후 bbox 정규화.
     """
     global _DT, _CAM_ID
     json_path = Path(json_path)
@@ -192,13 +246,24 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         "error": None
     }
     try:
-        # 1) JSON -> MOT GT
-        data = json_to_mot(json_path, out_dir)
-        file_name = (data.get("video") or {}).get("file_name")
+        # JSON에서 먼저 file_name만 뽑아 비디오 경로/크기 확인
+        data_raw = json.loads(json_path.read_text(encoding="utf-8"))
+        file_name = (data_raw.get("video") or {}).get("file_name") or data_raw.get("video")
         if not file_name:
             raise RuntimeError("JSON.video.file_name not found")
         video_path = resolve_video_path(Path(video_dir), file_name)
         summary["video"] = str(video_path)
+
+        # 비디오 크기 획득
+        cap_probe = cv2.VideoCapture(str(video_path))
+        if not cap_probe.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        img_w = int(cap_probe.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        img_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        cap_probe.release()
+
+        # 1) JSON -> MOT GT (좌표 정규화 포함)
+        data = json_to_mot(json_path, out_dir, img_w=img_w, img_h=img_h)
         gt = load_gt(out_dir/"gt"/"gt.txt")
 
         # 2) Video open
@@ -206,13 +271,12 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
 
-        # 워커 전역 DetectorAndTracker 사용
         dt = _DT
 
         acc = mm.MOTAccumulator(auto_id=True) if _HAS_MOT else None
         tp=fp=fn=0
         with res_det.open("w", encoding="utf-8") as f_det, res_trk.open("w", encoding="utf-8") as f_trk:
-            frame_idx = 0
+            frame_idx = 0  # 첫 프레임=1. JSON이 0기반이어도 매칭엔 영향 거의 없음
             while True:
                 ok, frame = cap.read()
                 if not ok: break
@@ -309,6 +373,25 @@ def _worker_main(video_jobs, video_dir, out_root, iou_thr):
         results.append(r)
     return results
 
+def _spawn_worker(cam_id, tracker, conf_thr, jobs, video_dir, out_root, iou_thr, out_conn):
+    """
+    각 프로세스 엔트리. 초기화 → 배정된 영상들 처리 → 결과 리스트를 파이프로 부모에 전달.
+    """
+    try:
+        _init_worker(cam_id, tracker, conf_thr)
+        out = _worker_main(jobs, video_dir, out_root, iou_thr)
+        out_conn.send(out)
+    except Exception as e:
+        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "error": f"{type(e).__name__}: {e}"} for j in jobs]
+        try:
+            out_conn.send(fallback)
+        except Exception:
+            pass
+    finally:
+        try:
+            out_conn.close()
+        except Exception:
+            pass
 
 def main():
     ap = argparse.ArgumentParser()
@@ -329,10 +412,10 @@ def main():
     if len(json_list)==0:
         raise RuntimeError(f"No JSON found in {json_dir}")
 
-    # 카메라 ID 1,2,3,4 로 고정. nproc은 최소 1, 최대 4만 의미있게 씀.
+    # 카메라 ID 1,2,3,4 고정. nproc은 최대 4만 의미 있게.
     camera_ids = [1,2,3,4][:max(1, min(args.nproc, 4))]
 
-    # 영상 단위로 라운드로빈 "배정"만 함. 프레임 단위가 아님.
+    # 영상 단위로 라운드로빈 "배정"만 함. 프레임 단위 아님.
     buckets = [[] for _ in camera_ids]
     for i, jp in enumerate(json_list):
         buckets[i % len(camera_ids)].append(str(jp))
@@ -363,39 +446,16 @@ def main():
     for p in procs:
         p.join()
 
-    # 요약 CSV
-    sum_dir = out_root / "_summary"; sum_dir.mkdir(parents=True, exist_ok=True)
-    csv_path = sum_dir / "metrics.csv"
-    fields = ["seq","video","camera_id","precision","recall","tp","fp","fn","idf1","idp","idr","mota","motp","num_switches","error"]
-    with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for r in results:
-            w.writerow({k:r.get(k) for k in fields})
-    print(f"[DONE] Wrote summary CSV -> {csv_path}")
-
-
-def _spawn_worker(cam_id, tracker, conf_thr, jobs, video_dir, out_root, iou_thr, out_conn):
-    """
-    각 프로세스 엔트리. 초기화 → 배정된 영상들 처리 → 결과 리스트를 파이프로 부모에 전달.
-    """
-    try:
-        _init_worker(cam_id, tracker, conf_thr)
-        out = _worker_main(jobs, video_dir, out_root, iou_thr)
-        out_conn.send(out)
-    except Exception as e:
-        # 실패한 경우에도 형식을 맞춘 결과를 보내 부모가 CSV 만들 수 있게 함
-        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "error": f"{type(e).__name__}: {e}"} for j in jobs]
-        try:
-            out_conn.send(fallback)
-        except Exception:
-            pass
-    finally:
-        try:
-            out_conn.close()
-        except Exception:
-            pass
-
+    # 요약 CSV (그래프만 볼 거면 주석 그대로 두면 됨)
+    # sum_dir = out_root / "_summary"; sum_dir.mkdir(parents=True, exist_ok=True)
+    # csv_path = sum_dir / "metrics.csv"
+    # fields = ["seq","video","camera_id","precision","recall","tp","fp","fn","idf1","idp","idr","mota","motp","num_switches","error"]
+    # with csv_path.open("w", newline="", encoding="utf-8") as f:
+    #     w = csv.DictWriter(f, fieldnames=fields)
+    #     w.writeheader()
+    #     for r in results:
+    #         w.writerow({k:r.get(k) for k in fields})
+    # print(f"[DONE] Wrote summary CSV -> {csv_path}")
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)

@@ -15,12 +15,14 @@ import io, base64
 
 from dotenv import load_dotenv
 from kafka_util import consumers, producers
-from deep_sort_realtime.deepsort_tracker import DeepSort
 from db_util.db_util import PostgreSQL
 from tracking_module.trackers import ByteTrackAdapter, OCSORTAdapter
 
 from PIL import Image
 from datetime import datetime
+
+import time
+from collections import deque
 
 
 class DetectorAndTracker:
@@ -31,7 +33,7 @@ class DetectorAndTracker:
         - Torch가 만든 primary CUDA context를 PyCUDA/TensorRT가 공유
         - GPU 만지는 구간에서만 push/pop (누수 방지)
         """
-        load_dotenv(override=True)
+        load_dotenv("../env/aws.env")
 
         # --- Kafka ---
         # self.frame_consumer = consumers.FrameConsumer(camera_id=cameraID)
@@ -109,6 +111,15 @@ class DetectorAndTracker:
         # self.embedder = self._cpu_embedder_safe
 
         self._print_engine_info()
+
+        # ------------ time info ------------------------------
+        self._perf = {
+        "infer_total": 0.0, "infer_count": 0, "infer_hist": deque(maxlen=50000),
+        "track_total": 0.0, "track_count": 0, "track_hist": deque(maxlen=50000),
+        "reid_total": 0.0, "reid_count": 0, "reid_hist": deque(maxlen=50000),
+        }
+        # ReID 왕복 시간 측정을 위해 요청 타임스탬프 기록
+        self._reid_pending_ts = {}   # key: track_id(or request_id) -> perf_counter()
 
 
     # --------------------- UTIL: CUDA ctx ---------------------
@@ -275,6 +286,27 @@ class DetectorAndTracker:
             return
         if gid <= 0 or lid < 0:
             return
+        
+        # for eval
+        roundtrip = None
+        start = self._reid_pending_ts.pop(lid, None)
+        if start is not None:
+            roundtrip = time.perf_counter() - start  # seconds
+        else:
+            # 요청 시각을 못 찾았으면 서비스가 준 내부시간(elapsed_ms)라도 사용
+            try:
+                ems = float(data.get("elapsed_ms", 0.0)) / 1000.0
+                roundtrip = ems if ems > 0 else None
+            except Exception:
+                roundtrip = None
+
+        if roundtrip is not None and roundtrip > 0:
+            self._perf["reid_total"] += roundtrip
+            self._perf["reid_count"] += 1
+            if (self._perf["infer_count"] % 50) == 1:
+                print(f"[DBG] infer_count={self._perf['infer_count']} track_count={self._perf['track_count']}")
+            self._perf["reid_hist"].append(roundtrip)
+        # for eval
         
         with self._state_lock:
             # 이미 처리됐으면 중복 방지
@@ -507,10 +539,19 @@ class DetectorAndTracker:
 
             
     # core
+    # DetectorAndTracker 클래스에 추가할 메서드들
+
     def detect_and_track(self, frame, debug=False, return_vis=False):
         # 0) Inference
         boxes, scores, class_ids, timing_info = self.infer(frame, debug)
 
+        # ★ infer 시간 누적
+        infer_time = float(timing_info.get("inference", timing_info.get("total", 0.0)))     # for eval
+        self._perf["infer_total"] += infer_time                                             # for eval
+        self._perf["infer_count"] += 1                                                      # for eval
+        self._perf["infer_hist"].append(infer_time)                                         # for eval
+
+        
         # 1) YOLO → tracker detections (사람만)
         h_img, w_img = frame.shape[:2]
         detections = []
@@ -526,7 +567,13 @@ class DetectorAndTracker:
             detections.append(([x1, y1, w, h], float(score), int(cid)))
 
         # 2) Update tracks (ByteTrack/OC-SORT는 embeds 안 씀)
+        t0_track = time.perf_counter()
         tracks = self.tracker.update_tracks(detections, frame=frame)
+        track_time = time.perf_counter() - t0_track
+
+        self._perf["track_total"] += track_time
+        self._perf["track_count"] += 1
+        self._perf["track_hist"].append(track_time)
 
         '''  
         # 2) 임베딩
@@ -587,6 +634,8 @@ class DetectorAndTracker:
                 idempotency_key=idemp
             )     
 
+            self._reid_pending_ts[tid] = time.perf_counter()            # for eval
+
             with self._state_lock:
                 self.pending_reid.add(tid)
                 self.local_id_set.add(tid)
@@ -626,7 +675,6 @@ class DetectorAndTracker:
         else:
             vis = None
         return vis, timing_info, boxes, scores, class_ids, tracks
-
     
     def draw_tracks(self, image, tracks):
         vis = image.copy()
@@ -676,3 +724,29 @@ class DetectorAndTracker:
             cv2.putText(res, label, (x1 + 5, y1 - 5),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
         return res
+    
+
+    # ---------------------------- for eval fps -----------------------------------------------------
+    def reset_fps_stats(self):
+        for k in ("infer_total","infer_count","track_total","track_count","reid_total","reid_count"):
+            self._perf[k] = 0.0 if k.endswith("total") else 0
+        self._perf["infer_hist"].clear()
+        self._perf["track_hist"].clear()
+        self._perf["reid_hist"].clear()
+
+    def get_fps_stats(self):
+        def _avg(t, c): return (t / c) if c > 0 else 0.0
+        infer_avg = _avg(self._perf["infer_total"], self._perf["infer_count"])
+        track_avg = _avg(self._perf["track_total"], self._perf["track_count"])
+        reid_avg  = _avg(self._perf["reid_total"],  self._perf["reid_count"])
+        return {
+            "infer_avg_sec": infer_avg,
+            "infer_fps": (1.0 / infer_avg) if infer_avg > 0 else 0.0,
+            "track_avg_sec": track_avg,
+            "track_fps": (1.0 / track_avg) if track_avg > 0 else 0.0,
+            "reid_avg_sec": reid_avg,
+            "reid_fps": (1.0 / reid_avg) if reid_avg > 0 else 0.0,
+            "infer_cnt": self._perf["infer_count"],
+            "track_cnt": self._perf["track_count"],
+            "reid_cnt": self._perf["reid_count"],
+        }

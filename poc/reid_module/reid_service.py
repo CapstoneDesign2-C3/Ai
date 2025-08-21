@@ -21,6 +21,9 @@ from torchvision import transforms
 from db_util.db_util import PostgreSQL
 from datetime import datetime
 
+import time     # for eval
+
+
 
 class ReIDService:
     def __init__(self, db: PostgreSQL):
