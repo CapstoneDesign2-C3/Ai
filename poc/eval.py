@@ -3,7 +3,8 @@ from pathlib import Path
 from collections import defaultdict
 import multiprocessing as mp
 import traceback
-# ... (중략: util, resolve_video_path 등 기존 함수 그대로 유지) ...
+from unicodedata import normalize
+import glob
 
 from tracking_module.detection_and_tracking import DetectorAndTracker
 
@@ -13,22 +14,7 @@ try:
 except Exception:
     _HAS_MOT = False
 
-# ---- how to use -----
-'''
-python eval.py \
-  --json-dir /home/hiperwall/Ai_modules/Ai/poc/labels \
-  --video-dir /home/hiperwall/Ai_modules/Ai/poc/videos \
-  --out-root ./eval_out \
-  --iou 0.3 --conf 0.25 \
-  --tracker ocsort \
-  --nproc 4 \
-  --camera-ids 1,2,3,4
-'''
-
-# --- 새로 추가 ---
-from unicodedata import normalize
-import glob
-
+# ----------------- 비디오 경로 해석 -----------------
 def resolve_video_path(video_dir: Path, file_name: str) -> Path:
     file_name = file_name.strip()
     file_name = normalize("NFC", file_name)
@@ -73,7 +59,7 @@ def resolve_video_path(video_dir: Path, file_name: str) -> Path:
 
     raise FileNotFoundError(f"Video not found for '{file_name}' under {video_dir}")
 
-# ----------------- 공통 유틸 -----------------
+# ----------------- 유틸 -----------------
 def iou_xywh(a, b):
     ax, ay, aw, ah = a
     bx, by, bw, bh = b
@@ -145,38 +131,21 @@ def load_gt(gt_txt: Path):
         per_frame[frame].append((tid, [x,y,w,h]))
     return per_frame
 
-try:
-    import motmetrics as mm
-    _HAS_MOT = True
-except Exception:
-    _HAS_MOT = False
-
-# ---- 워커 전역 (프로세스마다 딱 하나) ----
+# ---- 워커 전역 ----
 _DT = None
 _CAM_ID = None
 _TRACKER_KIND = None
 _CONF_THR = None
 
 def _init_worker(camera_id: int, tracker: str, conf_thr: float):
-    """
-    프로세스 시작 시 한 번만 DetectorAndTracker 생성해서 전역으로 보관.
-    각 워커는 고정된 camera_id로 카프카/리아이디 응답 컨슈머를 붙는다.
-    """
     global _DT, _CAM_ID, _TRACKER_KIND, _CONF_THR
     _CAM_ID = int(camera_id)
     _TRACKER_KIND = tracker
     _CONF_THR = float(conf_thr)
-
-    # 한 번만 생성
     _DT = DetectorAndTracker(cameraID=_CAM_ID, tracker_type=_TRACKER_KIND, conf_threshold=_CONF_THR)
     print(f"[worker] camera_id={_CAM_ID} detector-tracker ready")
 
-
 def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
-    """
-    기존 run_one에서 DetectorAndTracker 생성/해제 부분만 제거.
-    워커 전역 _DT 를 사용.
-    """
     global _DT, _CAM_ID
     json_path = Path(json_path)
     seq_name = json_path.stem
@@ -192,7 +161,7 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         "error": None
     }
     try:
-        # 1) JSON -> MOT GT
+        # 1) JSON → MOT GT
         data = json_to_mot(json_path, out_dir)
         file_name = (data.get("video") or {}).get("file_name")
         if not file_name:
@@ -206,9 +175,8 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         if not cap.isOpened():
             raise RuntimeError(f"Cannot open video: {video_path}")
 
-        # 워커 전역 DetectorAndTracker 사용
+        # 워커 전역 DetectorAndTracker
         dt = _DT
-
         acc = mm.MOTAccumulator(auto_id=True) if _HAS_MOT else None
         tp=fp=fn=0
         with res_det.open("w", encoding="utf-8") as f_det, res_trk.open("w", encoding="utf-8") as f_trk:
@@ -228,10 +196,10 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
                     dets.append([float(x),float(y),float(w),float(h),float(s)])
 
                 # tracking
-                vis, timing2, _bx, _sc, _ci, tracks = dt.detect_and_track(frame, debug=False, return_vis=False)
+                vis, _, _bx, _sc, _ci, tracks = dt.detect_and_track(frame, debug=False, return_vis=False)
                 trk_ids, trk_boxes = [], []
                 for t in tracks:
-                    l,t0,r,b = t.to_ltrb() if hasattr(t,"to_ltrb") else t.ltrb
+                    l,t0,r,b = t.to_ltrb()
                     x,y,w,h = float(l),float(t0),float(r-l),float(b-t0)
                     tid = int(t.track_id)
                     f_trk.write(f"{frame_idx},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1.0,-1,-1,-1\n")
@@ -298,17 +266,25 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         traceback.print_exc()
         return summary
 
-
 def _worker_main(video_jobs, video_dir, out_root, iou_thr):
-    """
-    워커 안에서 여러 영상을 순차 처리.
-    """
     results = []
     for jp in video_jobs:
         r = _process_one(jp, video_dir, out_root, iou_thr)
         results.append(r)
     return results
 
+def _spawn_worker(cam_id, tracker, conf_thr, jobs, video_dir, out_root, iou_thr, out_conn):
+    try:
+        _init_worker(cam_id, tracker, conf_thr)
+        out = _worker_main(jobs, video_dir, out_root, iou_thr)
+        out_conn.send(out)
+    except Exception as e:
+        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "error": f"{type(e).__name__}: {e}"} for j in jobs]
+        try: out_conn.send(fallback)
+        except Exception: pass
+    finally:
+        try: out_conn.close()
+        except Exception: pass
 
 def main():
     ap = argparse.ArgumentParser()
@@ -329,17 +305,13 @@ def main():
     if len(json_list)==0:
         raise RuntimeError(f"No JSON found in {json_dir}")
 
-    # 카메라 ID 1,2,3,4 로 고정. nproc은 최소 1, 최대 4만 의미있게 씀.
     camera_ids = [1,2,3,4][:max(1, min(args.nproc, 4))]
-
-    # 영상 단위로 라운드로빈 "배정"만 함. 프레임 단위가 아님.
     buckets = [[] for _ in camera_ids]
     for i, jp in enumerate(json_list):
         buckets[i % len(camera_ids)].append(str(jp))
 
     procs = []
     pipes = []
-
     for cam_idx, cam_id in enumerate(camera_ids):
         parent_conn, child_conn = mp.Pipe(duplex=False)
         p = mp.Process(
@@ -352,50 +324,19 @@ def main():
         procs.append(p)
         pipes.append(parent_conn)
 
-    # 결과 수집
     results = []
     for conn in pipes:
-        try:
-            results.extend(conn.recv())
-        except EOFError:
-            pass
+        try: results.extend(conn.recv())
+        except EOFError: pass
+    for p in procs: p.join()
 
-    for p in procs:
-        p.join()
-
-    # 요약 CSV
     sum_dir = out_root / "_summary"; sum_dir.mkdir(parents=True, exist_ok=True)
     csv_path = sum_dir / "metrics.csv"
     fields = ["seq","video","camera_id","precision","recall","tp","fp","fn","idf1","idp","idr","mota","motp","num_switches","error"]
     with csv_path.open("w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
-        w.writeheader()
-        for r in results:
-            w.writerow({k:r.get(k) for k in fields})
+        w = csv.DictWriter(f, fieldnames=fields); w.writeheader()
+        for r in results: w.writerow({k:r.get(k) for k in fields})
     print(f"[DONE] Wrote summary CSV -> {csv_path}")
-
-
-def _spawn_worker(cam_id, tracker, conf_thr, jobs, video_dir, out_root, iou_thr, out_conn):
-    """
-    각 프로세스 엔트리. 초기화 → 배정된 영상들 처리 → 결과 리스트를 파이프로 부모에 전달.
-    """
-    try:
-        _init_worker(cam_id, tracker, conf_thr)
-        out = _worker_main(jobs, video_dir, out_root, iou_thr)
-        out_conn.send(out)
-    except Exception as e:
-        # 실패한 경우에도 형식을 맞춘 결과를 보내 부모가 CSV 만들 수 있게 함
-        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "error": f"{type(e).__name__}: {e}"} for j in jobs]
-        try:
-            out_conn.send(fallback)
-        except Exception:
-            pass
-    finally:
-        try:
-            out_conn.close()
-        except Exception:
-            pass
-
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
