@@ -28,7 +28,6 @@ import time     # for eval
 class ReIDService:
     def __init__(self, db: PostgreSQL):
         # --- Env ---
-        load_dotenv('/home/hiperwall/Ai_modules/Ai/env/aws.env')
         self.broker = os.getenv('BROKER')
         self.request_topic = os.getenv('REID_REQUEST_TOPIC')
         self.response_topic = os.getenv('REID_RESPONSE_TOPIC')  # 중요: 응답 토픽
@@ -186,7 +185,7 @@ class ReIDService:
             try:
                 jpeg = self._pil_to_jpeg_bytes(img_pil)
                 feat_b64 = base64.b64encode(feat_vec.astype('float32').tobytes()).decode('utf-8')
-                self.db.addNewDetectedObject(uuid=new_id, crop_img=jpeg, feature=feat_b64, code_name=code_name)
+                self.db.addNewDetectedObject(uuid=new_id, crop_img=jpeg, code_name=code_name)
             except Exception as e:
                 self.logger.error(f"addNewDetectedObject failed: {e}")
 
@@ -299,7 +298,7 @@ class ReIDService:
 
 if __name__ == "__main__":
     # .env에서 DB 연결정보 읽어 DB 핸들 생성 후 서비스 기동
-    load_dotenv('../env/aws.env')
+
     db = PostgreSQL(
         os.getenv('DB_HOST'), os.getenv('DB_NAME'),
         os.getenv('DB_USER'), os.getenv('DB_PASSWORD'),
