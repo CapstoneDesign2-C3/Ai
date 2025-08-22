@@ -5,6 +5,7 @@ import multiprocessing as mp
 import traceback
 from unicodedata import normalize
 import glob
+import time
 
 # ---- how to use -----
 '''
@@ -114,7 +115,6 @@ def _normalize_bbox_list(bbox, img_w, img_h):
     elif p2 and not p1:
         x,y,w,h = cand_xyxy_as_xywh
     elif p1 and p2:
-        # 경계 초과 적은 쪽, 아니면 면적 작은 쪽
         over1 = (cand_xywh[0]+cand_xywh[2] > img_w+1e-3) or (cand_xywh[1]+cand_xywh[3] > img_h+1e-3)
         over2 = (cand_xyxy_as_xywh[0]+cand_xyxy_as_xywh[2] > img_w+1e-3) or (cand_xyxy_as_xywh[1]+cand_xyxy_as_xywh[3] > img_h+1e-3)
         if over1 and not over2:
@@ -128,7 +128,6 @@ def _normalize_bbox_list(bbox, img_w, img_h):
     else:
         return None
 
-    # 최종 클램프
     x = max(0.0, min(x, img_w-1.0))
     y = max(0.0, min(y, img_h-1.0))
     w = max(1.0, min(w, img_w - x))
@@ -136,7 +135,6 @@ def _normalize_bbox_list(bbox, img_w, img_h):
     return (x,y,w,h)
 
 def _pick_bbox(ann, img_w, img_h):
-    # 명시적 xyxy 우선
     if all(k in ann for k in ("x1","y1","x2","y2")):
         x1,y1,x2,y2 = float(ann["x1"]),float(ann["y1"]),float(ann["x2"]),float(ann["y2"])
         x,y,w,h = x1, y1, max(0.0, x2-x1), max(0.0, y2-y1)
@@ -154,7 +152,6 @@ def _pick_bbox(ann, img_w, img_h):
     else:
         return None
 
-    # 경계 클램프
     x = max(0.0, min(x, img_w-1.0))
     y = max(0.0, min(y, img_h-1.0))
     w = max(1.0, min(w, img_w - x))
@@ -186,14 +183,15 @@ def json_to_mot(json_path: Path, out_dir: Path, *, img_w: int, img_h: int):
         tid = id_map[ann_id]
         rows.append(f"{frame},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1,1,1.0")
 
-    (out_dir/"gt"/"gt.txt").write_text("\n".join(rows), encoding="utf-8")
+    # (out_dir/"gt"/"gt.txt").write_text("\n".join(rows), encoding="utf-8")  # ← 파일 저장 주석
+    data["_gt_rows"] = rows  # 파일 안 만들고 데이터로 보관
     return data
 
-def load_gt(gt_txt: Path):
+def load_gt_from_data(data):
+    """json_to_mot(...)가 돌려준 data에서 gt rows를 읽어 메모리로 구성"""
     per_frame = defaultdict(list)
-    if not gt_txt.exists():
-        return per_frame
-    for ln in gt_txt.read_text(encoding="utf-8").splitlines():
+    rows = data.get("_gt_rows", [])
+    for ln in rows:
         if not ln.strip(): continue
         parts = ln.split(",")
         frame = int(float(parts[0]))
@@ -213,10 +211,6 @@ _TRACKER_KIND = None
 _CONF_THR = None
 
 def _init_worker(camera_id: int, tracker: str, conf_thr: float):
-    """
-    프로세스 시작 시 한 번만 DetectorAndTracker 생성해서 전역으로 보관.
-    각 워커는 고정된 camera_id로 카프카/리아이디 응답 컨슈머를 붙는다.
-    """
     global _DT, _CAM_ID, _TRACKER_KIND, _CONF_THR
     _CAM_ID = int(camera_id)
     _TRACKER_KIND = tracker
@@ -228,27 +222,26 @@ def _init_worker(camera_id: int, tracker: str, conf_thr: float):
 
 def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
     """
-    기존 run_one에서 DetectorAndTracker 생성/해제 부분 제거.
-    워커 전역 _DT 사용. GT 생성 전 비디오 크기 먼저 획득 후 bbox 정규화.
+    전체 프레임 수(frame_idx)와 영상 처리 구간의 경과 시간(elapsed_sec)만으로 FPS 계산.
+    파일 저장 루틴은 전부 주석 처리.
     """
     global _DT, _CAM_ID
     json_path = Path(json_path)
     seq_name = json_path.stem
     out_dir = Path(out_root) / seq_name
-    res_det = out_dir / "res_det.txt"
-    res_trk = out_dir / "res_track.txt"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # res_det = out_dir / "res_det.txt"
+    # res_trk = out_dir / "res_track.txt"
+    # out_dir.mkdir(parents=True, exist_ok=True)  # ← 저장 안 함
 
     summary = {
         "seq": seq_name, "video": None, "camera_id": _CAM_ID,
-        "tp":0,"fp":0,"fn":0,"precision":0.0,"recall":0.0,
-        "idf1":None,"idp":None,"idr":None,"mota":None,"motp":None,"num_switches":None,
+        "frames": 0, "elapsed_sec": 0.0, "fps_total": 0.0,
         "error": None
     }
     try:
         # JSON에서 먼저 file_name만 뽑아 비디오 경로/크기 확인
         data_raw = json.loads(json_path.read_text(encoding="utf-8"))
-        file_name = (data_raw.get("video") or {}).get("file_name") or data_raw.get("video")
+        file_name = (data_raw.get("video") or {}).get("file_name")
         if not file_name:
             raise RuntimeError("JSON.video.file_name not found")
         video_path = resolve_video_path(Path(video_dir), file_name)
@@ -262,9 +255,9 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
         img_h = int(cap_probe.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
         cap_probe.release()
 
-        # 1) JSON -> MOT GT (좌표 정규화 포함)
+        # 1) JSON -> MOT GT (좌표 정규화 포함, 파일은 만들지 않음)
         data = json_to_mot(json_path, out_dir, img_w=img_w, img_h=img_h)
-        gt = load_gt(out_dir/"gt"/"gt.txt")
+        gt = load_gt_from_data(data)
 
         # 2) Video open
         cap = cv2.VideoCapture(str(video_path))
@@ -273,91 +266,40 @@ def _process_one(json_path: str, video_dir: str, out_root: str, iou_thr: float):
 
         dt = _DT
 
-        acc = mm.MOTAccumulator(auto_id=True) if _HAS_MOT else None
-        tp=fp=fn=0
-        with res_det.open("w", encoding="utf-8") as f_det, res_trk.open("w", encoding="utf-8") as f_trk:
-            frame_idx = 0  # 첫 프레임=1. JSON이 0기반이어도 매칭엔 영향 거의 없음
-            while True:
-                ok, frame = cap.read()
-                if not ok: break
-                frame_idx += 1
+        frame_idx = 0
+        t0 = time.perf_counter()  # ← 영상 처리 시작
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
 
-                # detection
-                boxes, scores, cids, _ = dt.infer(frame, debug=False)
-                dets=[]
-                for (x,y,w,h), s, cid in zip(boxes, scores, cids):
-                    if int(cid)!=0: continue
-                    if not math.isfinite(float(s)) or float(s) < _CONF_THR: continue
-                    f_det.write(f"{frame_idx},-1,{x:.2f},{y:.2f},{w:.2f},{h:.2f},{float(s):.6f},-1,-1,-1\n")
-                    dets.append([float(x),float(y),float(w),float(h),float(s)])
+            # detection + tracking만 수행. 결과 파일 기록은 주석.
+            _vis, _timing2, _bx, _sc, _ci, tracks = dt.detect_and_track(frame, debug=False, return_vis=False)
+            # if res_det.exists(): pass
+            # if res_trk.exists(): pass
 
-                # tracking
-                vis, timing2, _bx, _sc, _ci, tracks = dt.detect_and_track(frame, debug=False, return_vis=False)
-                trk_ids, trk_boxes = [], []
-                for t in tracks:
-                    l,t0,r,b = t.to_ltrb() if hasattr(t,"to_ltrb") else t.ltrb
-                    x,y,w,h = float(l),float(t0),float(r-l),float(b-t0)
-                    tid = int(t.track_id)
-                    f_trk.write(f"{frame_idx},{tid},{x:.2f},{y:.2f},{w:.2f},{h:.2f},1.0,-1,-1,-1\n")
-                    trk_ids.append(tid); trk_boxes.append([x,y,w,h])
-
-                # detection PR
-                gts = gt.get(frame_idx, [])
-                gt_boxes = [g[1] for g in gts]
-                matched=set()
-                for dx,dy,dw,dh,_ in dets:
-                    best=-1
-                    for gi, gb in enumerate(gt_boxes):
-                        if gi in matched: continue
-                        if iou_xywh([dx,dy,dw,dh], gb) >= iou_thr:
-                            best=gi; break
-                    if best>=0:
-                        matched.add(best); tp+=1
-                    else:
-                        fp+=1
-                fn += (len(gt_boxes)-len(matched))
-
-                # MOT metrics
-                if _HAS_MOT:
-                    import numpy as np
-                    gt_ids = [g[0] for g in gts]
-                    if len(gt_ids)==0 and len(trk_ids)==0:
-                        acc.update([],[],[])
-                    else:
-                        C = np.full((len(gt_ids), len(trk_ids)), np.inf, dtype=float)
-                        for i,gb in enumerate(gt_boxes):
-                            for j,tb in enumerate(trk_boxes):
-                                iou = iou_xywh(gb, tb)
-                                if iou >= iou_thr:
-                                    C[i,j] = 1.0 - iou
-                        acc.update(gt_ids, trk_ids, C)
-
+        t1 = time.perf_counter()  # ← 영상 처리 끝
         cap.release()
 
-        prec = tp / (tp + fp + 1e-9)
-        rec  = tp / (tp + fn + 1e-9)
-        summary.update({"tp":tp,"fp":fp,"fn":fn,"precision":prec,"recall":rec})
+        elapsed = max(1e-9, t1 - t0)
+        fps = frame_idx / elapsed
+        elapsed = max(1e-9, t1 - t0)
+        fps = frame_idx / elapsed
 
-        if _HAS_MOT:
-            mh = mm.metrics.create()
-            metr = mh.compute(acc, metrics=["idf1","idp","idr","mota","motp","num_switches"], name=seq_name)
-            row = metr.loc[seq_name]
-            summary.update({
-                "idf1": float(row.get("idf1", float("nan"))),
-                "idp": float(row.get("idp", float("nan"))),
-                "idr": float(row.get("idr", float("nan"))),
-                "mota": float(row.get("mota", float("nan"))),
-                "motp": float(row.get("motp", float("nan"))),
-                "num_switches": float(row.get("num_switches", float("nan"))),
-            })
+        summary.update({
+            "frames": frame_idx,
+            "elapsed_sec": elapsed,
+            "fps_total": fps
+        })
 
-        (out_dir/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
-        print(f"[OK][cam={_CAM_ID}] {seq_name}: P={prec:.3f} R={rec:.3f}  -> {out_dir}")
+        # (out_dir/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # ← 파일 저장 주석
+        print(f"[OK][cam={_CAM_ID}] {seq_name}: frames={frame_idx} elapsed={elapsed:.3f}s FPS={fps:.2f}")
         return summary
 
     except Exception as e:
         summary["error"] = f"{type(e).__name__}: {e}"
-        (out_dir/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        # (out_dir/"summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")  # ← 파일 저장 주석
         print(f"[ERR][cam={_CAM_ID}] {seq_name}: {summary['error']}")
         traceback.print_exc()
         return summary
@@ -382,7 +324,7 @@ def _spawn_worker(cam_id, tracker, conf_thr, jobs, video_dir, out_root, iou_thr,
         out = _worker_main(jobs, video_dir, out_root, iou_thr)
         out_conn.send(out)
     except Exception as e:
-        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "error": f"{type(e).__name__}: {e}"} for j in jobs]
+        fallback = [{"seq": Path(j).stem, "video": None, "camera_id": cam_id, "frames": 0, "elapsed_sec": 0.0, "fps_total": 0.0, "error": f"{type(e).__name__}: {e}"} for j in jobs]
         try:
             out_conn.send(fallback)
         except Exception:
@@ -406,7 +348,8 @@ def main():
 
     json_dir = Path(args.json_dir)
     video_dir = Path(args.video_dir)
-    out_root = Path(args.out_root); out_root.mkdir(parents=True, exist_ok=True)
+    out_root = Path(args.out_root)
+    # out_root.mkdir(parents=True, exist_ok=True)  # ← 결과 파일 저장 안 하므로 주석
 
     json_list = sorted(json_dir.glob("*.json"))
     if len(json_list)==0:
@@ -446,16 +389,26 @@ def main():
     for p in procs:
         p.join()
 
-    # 요약 CSV (그래프만 볼 거면 주석 그대로 두면 됨)
-    # sum_dir = out_root / "_summary"; sum_dir.mkdir(parents=True, exist_ok=True)
-    # csv_path = sum_dir / "metrics.csv"
-    # fields = ["seq","video","camera_id","precision","recall","tp","fp","fn","idf1","idp","idr","mota","motp","num_switches","error"]
-    # with csv_path.open("w", newline="", encoding="utf-8") as f:
-    #     w = csv.DictWriter(f, fieldnames=fields)
-    #     w.writeheader()
-    #     for r in results:
-    #         w.writerow({k:r.get(k) for k in fields})
-    # print(f"[DONE] Wrote summary CSV -> {csv_path}")
+    # conf별/전체 FPS 요약 출력
+    ok = [r for r in results if not r.get("error")]
+    if len(ok):
+        mean_fps = sum(r.get("fps_total", 0.0) for r in ok) / len(ok)
+        mean_elapsed = sum(r.get("elapsed_sec", 0.0) for r in ok) / len(ok)
+        total_frames = sum(r.get("frames", 0) for r in ok)
+        print(f"[SUMMARY] videos={len(ok)} frames={total_frames} mean_elapsed={mean_elapsed:.3f}s mean_FPS={mean_fps:.2f}")
+    else:
+        print("[SUMMARY] no successful results")
+
+     # 파일 저장 로직 전부 주석 (요약 CSV 등)
+    sum_dir = out_root / "_summary"; sum_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = sum_dir / "timing.csv"
+    fields = ["seq","video","camera_id","frames","elapsed_sec","fps_total","error"]
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in results:
+            w.writerow({k:r.get(k) for k in fields})
+    print(f"[DONE] Wrote timing CSV -> {csv_path}")
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
