@@ -509,71 +509,85 @@ class DetectorAndTracker:
     # DetectorAndTracker 클래스에 추가할 메서드들
 
     def detect_and_track(self, frame, debug=False, return_vis=False):
-        """Enhanced version with detailed timing measurements"""
-        # Start total timing
-        total_start = time.perf_counter()
-        
-        # 0) Inference (Detector timing)
-        detector_start = time.perf_counter()
+        # 0) Inference
         boxes, scores, class_ids, timing_info = self.infer(frame, debug)
-        detector_time = time.perf_counter() - detector_start
-        
-        # 1) Prepare detections for tracker
-        tracker_prep_start = time.perf_counter()
+
+        # 1) YOLO → tracker detections (사람만)
         h_img, w_img = frame.shape[:2]
         detections = []
         for box, score, cid in zip(boxes, scores, class_ids):
-            if int(cid) != 0:  # Only person class
+            if int(cid) != 0:
                 continue
             x1, y1, w, h = box
-            # Clamp to image boundaries
+            # 정수화 + 경계클램프
             x1 = max(0, min(int(round(x1)), w_img - 1))
             y1 = max(0, min(int(round(y1)), h_img - 1))
-            w = max(1, min(int(round(w)), w_img - x1))
-            h = max(1, min(int(round(h)), h_img - y1))
+            w  = max(1, min(int(round(w)),  w_img - x1))
+            h  = max(1, min(int(round(h)),  h_img - y1))
             detections.append(([x1, y1, w, h], float(score), int(cid)))
-        
-        # 2) Update tracks (Tracker timing)
-        tracker_start = time.perf_counter()
+
+        # 2) Update tracks (ByteTrack/OC-SORT는 embeds 안 씀)
         tracks = self.tracker.update_tracks(detections, frame=frame)
-        tracker_time = time.perf_counter() - tracker_start
+
+        '''  
+        # 2) 임베딩
+        # 임베딩 (없으면 None)
+        embeds = self.embedder(object_chips) if object_chips else None
+
+        # 방어 로직
+        if embeds is not None:
+            embeds = np.asarray(embeds, dtype=np.float32)
+            if embeds.ndim == 1:
+                embeds = embeds[None, :]
+            # 비유한값(NaN/Inf) -> 0
+            embeds[~np.isfinite(embeds)] = 0.0
+            # L2 정규화 (ε로 0 분모 방지)
+            norms = np.linalg.norm(embeds, axis=1, keepdims=True)
+            safe_norms = np.maximum(norms, 1e-6)
+            embeds = embeds / safe_norms
+            # 전부 0/무효면 appearance 없이 진행
+            if not np.isfinite(embeds).all() or np.all(norms < 1e-6):
+                embeds = None
         
-        # 3) ReID processing (ReID timing)
-        reid_start = time.perf_counter()
-        reid_requests = 0
+        if embeds is not None and len(embeds) != len(detections):
+                embeds = None
         
+
+        # 3) Track 업데이트
+        tracks = self.tracker.update_tracks(detections, embeds=embeds, frame=frame)
+        '''
+
+        #  Confirmed 신규 track만 ReID 요청용 crop 생성
+        # TODO: first appearance time - end appearance time time stamp
         for track in tracks:
             if not track.is_confirmed():
                 continue
             tid = track.track_id
-            
+
+            # local_id_set: 같은 local id에 대해서 요청을 한번만 보내기 위한 set
+            # pending_reid: ReID 요청을 보냈지만 아직 응답(= global_id 매핑)을 받지 못한 local_id 집합.
             if tid in self.local_id_set or tid in self.pending_reid:
                 continue
-            
-            # Extract crop and send ReID request
+
             l, t, r, b = track.to_ltrb()
-            l = int(round(l))
-            t = int(round(t))
-            r = int(round(r))
-            b = int(round(b))
-            w = max(1, r - l)
-            h = max(1, b - t)
-            crop = frame[max(t, 0):max(b, 0), max(l, 0):max(r, 0)]
-            
+            l = int(round(l)); t = int(round(t)); r = int(round(r)); b = int(round(b))
+            w = max(1, r - l); h = max(1, b - t)
+            crop = frame[max(t,0):max(b,0), max(l,0):max(r,0)]
             if crop.size == 0:
                 continue
-            
-            # Send Kafka message
-            idempotency_key = f"{self.camera_id}:{tid}"
+
+            # Kafka 전송 (base64 JSON)
+            # tracker 처음 들어왔을 때만 보내는 위치로
+            idemp = f"{self.camera_id}:{tid}"
             self.result_producer.send_message(
                 crop,
                 track_id=tid,
                 bbox=[l, t, w, h],
                 class_name="person",
                 encoding="base64",
-                idempotency_key=idempotency_key
-            )
-            
+                idempotency_key=idemp
+            )     
+
             with self._state_lock:
                 self.pending_reid.add(tid)
                 self.local_id_set.add(tid)
@@ -584,76 +598,35 @@ class DetectorAndTracker:
                     "gid": None,
                     "detection_id": None,
                 }
-            
-            reid_requests += 1
         
-        reid_time = time.perf_counter() - reid_start
-        
-        # 4) Track lifecycle management
-        lifecycle_start = time.perf_counter()
+        # 객체가 마지막으로 관측된 시간 DB에 업데이트
         curr_ids = {t.track_id for t in tracks if t.is_confirmed()}
         now_ms = int(time.time() * 1000)
-        
-        # Remove deadlines for currently visible tracks
+        # 2-1) 현재 보이는 트랙은 데드라인 제거
         with self._state_lock:
             for lid in list(self.end_deadlines.keys()):
                 if lid in curr_ids:
                     self.end_deadlines.pop(lid, None)
-        
-        # Set deadlines for disappeared tracks
+
+        # 2-2) 이번 프레임에 사라진 lid는 데드라인 설정(최초 1회)
         ended = set(self.track_start_ts.keys()) - curr_ids
         with self._state_lock:
             for lid in ended:
                 self.end_deadlines.setdefault(lid, now_ms + self.end_grace_ms)
-        
-        # Finalize tracks past deadline
-        for lid, deadline in list(self.end_deadlines.items()):
-            if now_ms >= deadline:
-                self._finalize_track(lid, exit_ms=deadline)
+
+        # 2-3) 데드라인이 지난 트랙만 실제 finalize
+        for lid, ddl in list(self.end_deadlines.items()):
+            if now_ms >= ddl:
+                self._finalize_track(lid, exit_ms=ddl)
                 with self._state_lock:
                     self.end_deadlines.pop(lid, None)
-        
-        lifecycle_time = time.perf_counter() - lifecycle_start
-        
-        # 5) Visualization if requested
-        vis_start = time.perf_counter()
+
+        # 5) return_vis = True인 경우 시각화 프레임 return 
         if return_vis:
             vis = self.draw_tracks(frame, tracks)
         else:
             vis = None
-        vis_time = time.perf_counter() - vis_start
-        
-        total_time = time.perf_counter() - total_start
-        
-        # Enhanced timing information
-        enhanced_timing = {
-            'detector_time': detector_time,
-            'tracker_time': tracker_time,
-            'reid_time': reid_time,
-            'lifecycle_time': lifecycle_time,
-            'vis_time': vis_time,
-            'total_time': total_time,
-            'reid_requests': reid_requests,
-            'active_tracks': len([t for t in tracks if t.is_confirmed()]),
-            'detections_count': len(detections),
-            **timing_info  # Include original timing info
-        }
-        
-        return vis, enhanced_timing, boxes, scores, class_ids, tracks
-
-
-    def get_performance_stats(self) -> dict[str, float]:
-        """Get current performance statistics"""
-        with self._state_lock:
-            return {
-                'active_tracks': len(self.local_id_set),
-                'pending_reid': len(self.pending_reid),
-                'inflight_reid': len(self.inflight_reid),
-                'tracked_objects': len(self.local_to_global),
-                'end_scheduled': len([lc for lc in self.track_lifecycle.values() 
-                                    if lc.get("status") == "end_scheduled"])
-            }
-
+        return vis, timing_info, boxes, scores, class_ids, tracks
     
     def draw_tracks(self, image, tracks):
         vis = image.copy()
