@@ -1,0 +1,182 @@
+# syntax=docker/dockerfile:1.6
+############################
+# 0) pycuda wheel 빌더 (CUDA headers 필요)
+############################
+FROM nvidia/cuda:12.4.1-devel-ubuntu22.04 AS pycuda-wheel
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.10 python3-pip python3-dev build-essential && \
+    rm -rf /var/lib/apt/lists/*
+RUN python3 -m pip install -U pip wheel numpy
+RUN CUDAHOSTCXX=/usr/bin/g++ python3 -m pip wheel pycuda==2023.1 -w /wheels
+
+############################
+# 1) Base (micromamba env)
+############################
+FROM nvidia/cuda:12.4.1-runtime-ubuntu22.04 AS base
+
+# NVIDIA 이미지에는 기본적인 것들이 있으므로 GPG 키 문제 해결 부분은 대부분 필요 없습니다.
+# 필요한 패키지만 설치합니다.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    wget \
+    ca-certificates \
+    build-essential \
+    pkg-config \
+    python3-dev \
+    libgl1 \
+    libglib2.0-0 && \
+    rm -rf /var/lib/apt/lists/*
+
+# Micromamba를 수동으로 설치합니다.
+# 이렇게 하면 CUDA 런타임 환경 위에 Mamba를 깨끗하게 올릴 수 있습니다.
+ENV MAMBA_USER=mamba
+ENV MAMBA_ROOT_PREFIX=/opt/conda
+ENV MAMBA_EXE=/bin/micromamba
+
+RUN useradd --create-home --shell /bin/bash --uid 1000 ${MAMBA_USER} && \
+    wget -qO- https://micromamba.snakepit.net/api/micromamba/linux-64/latest | tar -xvj -C /usr/local/bin --strip-components=1 bin/micromamba && \
+    mkdir -p ${MAMBA_ROOT_PREFIX} && \
+    chown -R ${MAMBA_USER}:${MAMBA_USER} ${MAMBA_ROOT_PREFIX}
+
+USER $MAMBA_USER
+
+WORKDIR /app/poc
+# # GPG 키 문제 해결 및 패키지 설치
+# USER root
+# # GPG 키 업데이트 및 APT 소스 초기화
+# RUN apt-get clean && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     apt-get update --allow-insecure-repositories || true && \
+#     apt-get install -y --no-install-recommends --allow-unauthenticated \
+#         ca-certificates \
+#         gnupg \
+#         lsb-release && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/*
+
+# # Debian 키 재설정
+# RUN apt-get update --allow-insecure-repositories && \
+#     apt-get install -y --no-install-recommends --allow-unauthenticated \
+#         debian-archive-keyring && \
+#     apt-get clean && \
+#     rm -rf /var/lib/apt/lists/*
+
+# # 이제 정상적으로 패키지 설치
+# RUN apt-get update && apt-get install -y --no-install-recommends \
+#     build-essential pkg-config python3-dev && \
+#     rm -rf /var/lib/apt/lists/* && \
+#     apt-get clean
+    
+# RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0
+
+# USER $MAMBA_USER
+
+# ── conda env 생성 (env 이름: tracker) - environment2.yml 사용
+COPY poc/environment2.yml ./environment2.yml
+RUN micromamba create -y -n tracker -f environment2.yml && micromamba clean -ya \
+    && micromamba install -y -n tracker pip setuptools wheel \
+    && micromamba run -n tracker python --version && micromamba run -n tracker pip --version
+
+# 이후 모든 RUN은 tracker env 안에서 실행
+SHELL ["micromamba", "run", "-n", "tracker", "/bin/bash", "-c"]
+
+# pip 정책
+ENV PIP_NO_INPUT=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+ENV PIP_PREFER_BINARY=1
+
+# pip 업그레이드
+RUN pip install --upgrade pip && \
+    pip cache purge
+
+# (1) numpy 먼저
+RUN pip install --no-cache-dir numpy==1.26.4 && \
+    pip cache purge
+
+# (2) PyTorch/cu124
+RUN pip install --no-cache-dir --extra-index-url https://download.pytorch.org/whl/cu124 \
+    torch==2.5.1+cu124 torchvision==0.20.1+cu124 && \
+    pip cache purge
+
+RUN pip install cython --no-cache-dir && pip cache purge
+
+# (3) 일반 패키지
+RUN pip install --no-cache-dir \
+    opencv-python==4.8.1.78 \
+    Pillow==11.0.0 \
+    python-dotenv==1.1.1 \
+    kafka-python==2.2.15 \
+    torchreid==0.2.5 \
+    faiss-gpu \
+    gdown \
+    tensorboard && pip cache purge
+# faiss-gpu, gdown, tensorboard, cpython은 reid 전용인것같다.
+
+# (4) lap 빌드 회피: lapx 먼저, ocsort는 --no-deps
+RUN pip install --no-cache-dir lapx==0.5.11.post1 filterpy==1.4.5 && \
+    pip install --no-cache-dir ocsort==0.0.2 --no-deps && \
+    pip cache purge
+
+# (5) TensorRT/cu12 묶음 - 개별 설치로 메모리 절약
+RUN pip install --no-cache-dir tensorrt==10.13.0.35 && \
+    pip cache purge
+
+RUN pip install --no-cache-dir tensorrt-cu12==10.13.0.35 && \
+    pip cache purge
+
+RUN pip install --no-cache-dir tensorrt-cu12-bindings==10.13.0.35 && \
+    pip cache purge
+
+RUN pip install --no-cache-dir tensorrt-cu12-libs==10.13.0.35 && \
+    pip cache purge && \
+    # 불필요한 파일 정리
+    find /opt/conda/envs/tracker -name "*.pyc" -delete && \
+    find /opt/conda/envs/tracker -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+
+# (6) pycuda: 권한 문제 해결
+USER root
+COPY --from=pycuda-wheel /wheels/pycuda-2023.1-*.whl /app/wheels/
+RUN chown -R $MAMBA_USER:$MAMBA_USER /app/wheels/
+USER $MAMBA_USER
+
+RUN pip install --no-cache-dir /app/wheels/pycuda-2023.1-*.whl && \
+    rm -rf /app/wheels/ && \
+    pip cache purge
+
+# ── 공용 코드
+COPY poc/db_util                ./db_util
+COPY poc/kafka_util             ./kafka_util
+COPY poc/nvr_util               ./nvr_util
+# COPY poc/cp_that.py             ./cp_that.py
+COPY poc/eval.py                ./eval.py
+COPY poc/smoke_test_one_cam.py  ./smoke_test_one_cam.py
+COPY poc/test_engine.py         ./test_engine.py
+# COPY env/aws.env                ../env/aws.env
+
+# 공통 환경 변수
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV TZ=Asia/Seoul
+ENV PYTHONPATH=/app:/app/poc
+
+############################
+# 2) tracker 이미지
+############################
+FROM base AS tracker
+WORKDIR /app/poc
+COPY poc/tracking_module ./tracking_module
+COPY poc/yolo_engine     ./yolo_engine
+COPY poc/run.py ./run.py
+ENV ENGINE_PATH=/app/poc/yolo_engine/yolo11m_fp16.engine
+# ENTRYPOINT ["/usr/local/bin/_entrypoint.sh", "/bin/bash", "-c"]  <- 이 줄을 삭제하거나 주석 처리
+# CMD ["micromamba run -n tracker python smoke_test_one_cam.py"] <- 이 줄을 아래와 같이 변경
+CMD ["micromamba", "run", "-n", "tracker", "python", "run.py"]
+############################
+# 3) reid 이미지
+############################
+FROM base AS reid
+WORKDIR /app/poc
+COPY poc/reid_module ./reid_module
+
+# ENTRYPOINT ["/usr/local/bin/_entrypoint.sh", "/bin/bash", "-c"]  <- 이 줄을 삭제하거나 주석 처리
+# CMD ["micromamba run -n reid python -m reid_module.reid_service"] <- 이 줄을 아래와 같이 변경
+CMD ["micromamba", "run", "-n", "tracker", "python", "-m", "reid_module.reid_service"]
