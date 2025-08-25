@@ -46,6 +46,9 @@ class ReIDService:
         self.dim = 512
         self.threshold = float(os.getenv('REID_THRESHOLD', 0.73))
 
+        # --- Faiss Index 파일 로드 ---
+        self.index_path = "./reid_index.faiss"
+
         # --- Init ---
         self._init_faiss_index()
         self._init_model()
@@ -65,14 +68,42 @@ class ReIDService:
 
     # ----------------------- Init -----------------------
     def _init_faiss_index(self):
-        """FAISS index (IP + IDMap). GPU 가능 시 GPU index 사용."""
-        if self.device.type == 'cuda':
-            res = faiss.StandardGpuResources()
-            cpu_idx = faiss.IndexFlatIP(self.dim)
-            cpu_idx = faiss.IndexIDMap(cpu_idx)
-            self.index = faiss.index_cpu_to_gpu(res, 0, cpu_idx)
+        """
+        ./reid_index.faiss 가 있으면 읽고, 없으면 새로 만들고,
+        GPU 가능하면 CPU→GPU로 올린다.
+        """
+        def _new_cpu():
+            return faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
+
+        cpu_idx = None
+        path = self.index_path
+
+        # 1) 로컬에서 시도
+        if os.path.exists(path):
+            try:
+                cpu_idx = faiss.read_index(path)
+                if not isinstance(cpu_idx, faiss.IndexIDMap):
+                    cpu_idx = faiss.IndexIDMap(cpu_idx)
+                if cpu_idx.d != self.dim:
+                    # 차원 안 맞으면 깔끔하게 새로
+                    cpu_idx = _new_cpu()
+            except Exception as e:
+                # 파일이 깨졌거나 버전 불일치 → 새로
+                cpu_idx = _new_cpu()
         else:
-            self.index = faiss.IndexIDMap(faiss.IndexFlatIP(self.dim))
+            cpu_idx = _new_cpu()
+
+        # 2) GPU로 승격(가능하면)
+        if self.device.type == 'cuda':
+            try:
+                res = faiss.StandardGpuResources()
+                self.index = faiss.index_cpu_to_gpu(res, 0, cpu_idx)
+                self._gpu_res = res  # 선택: 보관만
+            except Exception:
+                # GPU 초기화 실패 시 CPU로
+                self.index = cpu_idx
+        else:
+            self.index = cpu_idx
 
     def _init_model(self):
         # 출력 임베드 차원 확인할 것 e.g. resnet152 = 2048
@@ -146,7 +177,6 @@ class ReIDService:
         img.save(buf, format="JPEG", quality=quality)
 
         return buf.getvalue()
-
 
 
     # ----------------------- Core -----------------------
@@ -286,7 +316,37 @@ class ReIDService:
         finally:
             self.cleanup()
 
+    # ----------------------- For clean up -------------------
+    def _save_index(self):
+        """
+        GPU 인덱스면 CPU로 내려서 ./reid_index.faiss 로 저장.
+        """
+        try:
+            idx = self.index
+            try:
+                idx = faiss.index_gpu_to_cpu(idx)
+            except Exception:
+                pass
+            faiss.write_index(idx, self.index_path)
+            # 필요하면: print 또는 logger
+    
+        except Exception as e:
+            # 저장 실패해도 서비스 종료는 막지 않음
+            try:
+                self.logger.error(f"Failed to save FAISS index: {e}")
+            except Exception:
+                pass
+
     def cleanup(self):
+        """
+        종료 직전 호출되는 함수들
+        """
+
+        # faiss index들 저장.
+        try:
+            self._save_index()
+        except Exception:
+            pass
         if hasattr(self, 'consumer'):
             try: self.consumer.close()
             except Exception: pass
