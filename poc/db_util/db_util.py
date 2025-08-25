@@ -1,5 +1,8 @@
 import psycopg2
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+KST = ZoneInfo("Asia/Seoul")
 
 class PostgreSQL:
     def __init__(self, host, dbname, user, password, port, *, autocommit=False):
@@ -41,7 +44,7 @@ class PostgreSQL:
                 raise ValueError(f"uuid({uuid})가 detected_object에 없습니다.")
             detected_object_id = row[0]
 
-            utc_appeared = datetime.utcfromtimestamp(appeared_time/1000.0)
+            appeared = datetime.fromtimestamp(appeared_time/1000.0,  tz=timezone.utc).astimezone(KST).replace(tzinfo=None)
 
             # 같은 객체의 '열린' 세션이 있으면 잡아서 재사용 (동시에 들어와도 FOR UPDATE로 직렬화)
             cursor.execute("""
@@ -56,13 +59,13 @@ class PostgreSQL:
                     UPDATE detection
                     SET appeared_time = LEAST(appeared_time, %s)
                     WHERE id = %s
-                """, (utc_appeared, det_id))
+                """, (appeared, det_id))
             else:
                 cursor.execute("""
                     INSERT INTO detection (detected_object_id, appeared_time, exit_time, crop_img)
                     VALUES (%s, %s, %s, %s)
                     RETURNING id
-                """, (detected_object_id, utc_appeared, exit_time, psycopg2.Binary(crop_img)))
+                """, (detected_object_id, appeared, exit_time, psycopg2.Binary(crop_img)))
                 det_id = cursor.fetchone()[0]
 
             cursor.execute("COMMIT;")
@@ -75,12 +78,11 @@ class PostgreSQL:
         exit_time: epoch ms(int) 또는 datetime
         """
         if isinstance(exit_time, (int, float)):
-            exit_dt = datetime.utcfromtimestamp(exit_time / 1000.0)
+            exit_dt = datetime.fromtimestamp(exit_time / 1000.0, tz=timezone.utc).astimezone(KST).replace(tzinfo=None)
         elif isinstance(exit_time, datetime):
             exit_dt = exit_time
         else:
             raise TypeError("exit_time must be epoch ms or datetime")
-
 
         with self.db.cursor() as cursor:
             cursor.execute(
