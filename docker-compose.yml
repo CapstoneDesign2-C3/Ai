@@ -96,7 +96,7 @@ services:
       - internal
 
   kafka-setup:
-    image: confluentinc/cp-kafka:latest
+    image: confluentinc/cp-kafka:7.4.0
     container_name: kafka-setup
     depends_on:
       kafka:
