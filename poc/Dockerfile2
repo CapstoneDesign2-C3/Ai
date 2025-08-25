@@ -139,7 +139,7 @@ COPY poc/tracking_module ./tracking_module
 COPY poc/yolo_engine     ./yolo_engine
 ENV ENGINE_PATH=/app/poc/yolo_engine/yolo11m_fp16.engine
 ENTRYPOINT ["/usr/local/bin/_entrypoint.sh", "/bin/bash", "-c"]
-CMD ["micromamba run -n tracker python smoke_test_one_cam.py"]
+CMD ["micromamba run -n tracker python run.py"]
 
 ############################
 # 3) reid 이미지
