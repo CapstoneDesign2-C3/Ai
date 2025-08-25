@@ -1,0 +1,200 @@
+services:
+  db:
+    image: postgres:17.4
+    container_name: db
+    environment:
+      POSTGRES_DB: ${POSTGRESQL_DATABASE}
+      POSTGRES_USER: ${POSTGRESQL_USERNAME}
+      POSTGRES_PASSWORD: ${POSTGRESQL_PASSWORD}
+      TZ: ${TZ}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    restart: unless-stopped
+    healthcheck:
+      # 컨테이너 내부에서 로컬 서버로 체크
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRESQL_USERNAME} -d ${POSTGRESQL_DATABASE}",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - internal
+
+  backend:
+    image: backend
+    pull_policy: never
+    container_name: backend
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      TZ: ${TZ}
+      POSTGRESQL_URL: db
+      POSTGRESQL_PORT: ${POSTGRESQL_PORT}
+      POSTGRESQL_DATABASE: ${POSTGRESQL_DATABASE}
+      POSTGRESQL_USERNAME: ${POSTGRESQL_USERNAME}
+      POSTGRESQL_PASSWORD: ${POSTGRESQL_PASSWORD}
+      GOOGLE_MAP_API_KEY: ${GOOGLE_MAP_API_KEY}
+      SERVER_PORT: 8080
+    ports:
+      - "8080:8080"
+    networks:
+      - internal
+    restart: unless-stopped
+
+  frontend:
+    image: frontend
+    pull_policy: never
+    container_name: frontend
+    depends_on:
+      backend:
+        condition: service_started
+    ports:
+      - "80:3000"
+    networks:
+      - internal
+    restart: unless-stopped
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - internal
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "kafka-topics",
+          "--bootstrap-server",
+          "localhost:9092",
+          "--list",
+        ]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 40s
+    networks:
+      - internal
+
+  kafka-setup:
+    image: confluentinc/cp-kafka:latest
+    container_name: kafka-setup
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command: |
+      "
+      echo 'Kafka is healthy. Creating topics...'
+
+      # 토픽 생성
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic reid-request --partitions 4 --replication-factor 1
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic reid-response --partitions 4 --replication-factor 1
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic camera-frames --partitions 4 --replication-factor 1
+
+      kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists --topic detected-result --partitions 4 --replication-factor 1
+
+      echo \"Topics created successfully.\"
+      "
+    networks:
+      - internal
+
+  tracker:
+    build:
+      context: .
+      dockerfile: Dockerfile2
+      target: tracker
+    container_name: tracker
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      TZ: ${TZ}
+      # DB 설정
+      DB_HOST: db
+      DB_NAME: ${POSTGRESQL_DATABASE}
+      DB_USER: ${POSTGRESQL_USERNAME}
+      DB_PASSWORD: ${POSTGRESQL_PASSWORD}
+      DB_PORT: ${POSTGRESQL_PORT}
+      # Kafka 설정
+      BROKER: kafka:9092
+      ENGINE_PATH: ${ENGINE_PATH}
+      # Topic 설정
+      BASIC: ${BASIC}
+      FRAME_TOPIC: ${FRAME_TOPIC}
+      DETECTED_RESULT: ${DETECTED_RESULT}
+      REID_REQUEST_TOPIC: ${REID_REQUEST_TOPIC}
+      REID_RESPONSE_TOPIC: ${REID_RESPONSE_TOPIC}
+      # ReID 임계값 설정
+      REID_THRESHOLD: ${REID_THRESHOLD}
+    networks:
+      - internal
+    init: true
+    restart: unless-stopped
+    gpus: all
+
+  reid:
+    build:
+      context: .
+      dockerfile: Dockerfile2
+      target: reid
+    container_name: reid
+    depends_on:
+      db:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    environment:
+      TZ: ${TZ}
+      # DB 설정
+      DB_HOST: db
+      DB_NAME: ${POSTGRESQL_DATABASE}
+      DB_USER: ${POSTGRESQL_USERNAME}
+      DB_PASSWORD: ${POSTGRESQL_PASSWORD}
+      DB_PORT: ${POSTGRESQL_PORT}
+      # Kafka 설정
+      BROKER: kafka
+      ENGINE_PATH: ${ENGINE_PATH}
+      # Topic 설정
+      BASIC: ${BASIC}
+      FRAME_TOPIC: ${FRAME_TOPIC}
+      DETECTED_RESULT: ${DETECTED_RESULT}
+      REID_REQUEST_TOPIC: ${REID_REQUEST_TOPIC}
+      REID_RESPONSE_TOPIC: ${REID_RESPONSE_TOPIC}
+      # ReID 임계값 설정
+      REID_THRESHOLD: ${REID_THRESHOLD}
+    networks:
+      - internal
+    init: true
+    restart: unless-stopped
+    gpus: all
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  db_data:
