@@ -16,3 +16,10 @@ poc/sample.mp4
 
 poc/videos 
 poc/labels
+
+*.tar
+*.exe
+*.hwpx
+*.sql
+*.pdf
+*.bat
